@@ -1,10 +1,43 @@
-"""3D View sidebar panel (plan §32).
+"""Sidebar UI: collapsible subpanels under Weapon Animation (Blender idiom).
 
-Milestone 1 scope (plan §48): Weapon Rig (detect/create), Hands
-(attach/detach/mode), Debug (validate + report). Snap/Pivot/Aim/Bake
-sections arrive with their own milestones and are intentionally absent here.
+One panel per workflow step instead of a single long scroll: Rig Setup,
+Hands, Pivot, Rotate, Aim, Bake, Debug. Buttons show live state where it
+matters (attached/free hands, active pivot preset), everything else is the
+same operators and scene props as before.
 """
 import bpy
+
+from ..utils import constraints as con_util
+
+
+def _arm(scene):
+    arm = scene.wpn_armature
+    if arm is None or arm.type != 'ARMATURE':
+        return None
+    return arm
+
+
+def _attach_state(arm, side):
+    try:
+        con = con_util.find_attach_constraint(arm, side)
+        return con is not None and con.influence > 0.0
+    except Exception:
+        return False
+
+
+def _subpanel(label, closed=False):
+    """Class decorator stamping standard subpanel boilerplate."""
+    def wrap(cls):
+        cls.bl_label = label
+        cls.bl_idname = "WPN_PT_" + label.lower().replace(" ", "_")
+        cls.bl_space_type = 'VIEW_3D'
+        cls.bl_region_type = 'UI'
+        cls.bl_category = "Weapon"
+        cls.bl_parent_id = "WPN_PT_main"
+        if closed:
+            cls.bl_options = {'DEFAULT_CLOSED'}
+        return cls
+    return wrap
 
 
 class WPN_PT_main(bpy.types.Panel):
@@ -17,189 +50,175 @@ class WPN_PT_main(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-
-        # ------------------------------------------------------------------
-        # Weapon Rig
-        # ------------------------------------------------------------------
-        box = layout.box()
-        box.label(text="Weapon Rig", icon='OUTLINER_OB_ARMATURE')
-        col = box.column(align=True)
+        col = layout.column(align=True)
         col.operator("wpn.auto_detect", icon='VIEWZOOM')
         col.operator("wpn.create_rig", icon='ADD')
-
-        arm = scene.wpn_armature
+        arm = _arm(scene)
         if arm is not None:
-            box.label(text="Character: %s" % arm.name, icon='ARMATURE_DATA')
+            layout.label(text="Character: %s" % arm.name,
+                         icon='ARMATURE_DATA')
         else:
-            box.label(text="Character: (none -- Auto Detect)", icon='ERROR')
+            layout.label(text="No rig: Auto Detect first",
+                         icon='ERROR')
 
-        # Grip reference points (rework: bone-local vectors in custom
-        # props, not bones). Editable here; presets store per-weapon sets.
-        # Markers in the 3D view show where each point is; the cursor
-        # buttons place a point exactly at the 3D cursor.
-        wbone = None
-        if arm is not None:
-            wbone = arm.data.bones.get("weapon")
-        if wbone is not None:
-            for prop, label, target in (("grip_r", "Grip R", "GRIP_R"),
-                                        ("grip_l", "Grip L", "GRIP_L"),
-                                        ("guard_l", "Guard L",
-                                         "GUARD_L"),
-                                        ("guard_r", "Guard R",
-                                         "GUARD_R"),
-                                        ("pommel", "Pommel", "POMMEL"),
-                                        ("center", "Center", "CENTER"),
-                                        ("tip", "Tip", "TIP")):
-                row = box.row(align=True)
-                row.prop(wbone, '["%s"]' % prop, text=label)
-                op = row.operator("wpn.grip_from_cursor", text="",
-                                  icon='CURSOR')
-                op.target = target
-            row = box.row(align=True)
-            row.prop(scene, "wpn_show_grips", text="Show Points")
 
-        # Weapon presets (plan §17): same framework, different weapons.
-        row = box.row()
-        row.label(text="Weapon:")
+@_subpanel("Rig Setup", closed=True)
+class WPN_PT_rig_setup(bpy.types.Panel):
+    bl_description = "Grip points, weapon presets, preview mesh"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        scene = context.scene
+        arm = _arm(scene)
+        wbone = arm.data.bones.get("weapon") if arm is not None else None
+        if wbone is None:
+            layout.label(text="Create the rig first", icon='INFO')
+            return
+        for prop, label, target in (("grip_r", "Grip R", "GRIP_R"),
+                                    ("grip_l", "Grip L", "GRIP_L"),
+                                    ("guard_l", "Guard L", "GUARD_L"),
+                                    ("guard_r", "Guard R", "GUARD_R"),
+                                    ("pommel", "Pommel", "POMMEL"),
+                                    ("center", "Center", "CENTER"),
+                                    ("tip", "Tip", "TIP")):
+            row = layout.row(align=True)
+            row.prop(wbone, '["%s"]' % prop, text=label)
+            op = row.operator("wpn.grip_from_cursor", text="",
+                              icon='CURSOR')
+            op.target = target
+        layout.prop(scene, "wpn_show_grips", text="Show Points")
+
+        layout.separator()
+        row = layout.row()
+        row.label(text="Preset:")
         if scene.wpn_presets:
             idx = max(0, min(scene.wpn_preset_index,
                              len(scene.wpn_presets) - 1))
             row.label(text=scene.wpn_presets[idx].name, icon='PRESET')
         else:
-            row.label(text="(no presets)", icon='PRESET')
-        row = box.row(align=True)
+            row.label(text="(none)", icon='PRESET')
+        row = layout.row(align=True)
         row.prop(scene, "wpn_preset_name", text="")
         op = row.operator("wpn.save_preset", text="", icon='ADD')
         op.name = scene.wpn_preset_name or "Weapon"
-        op = box.operator("wpn.apply_preset", text="Apply Preset",
-                          icon='IMPORT')
+        layout.operator("wpn.apply_preset", text="Apply Preset",
+                        icon='IMPORT')
 
-        # Preview weapon mesh (plan §16): viewport stand-in for the UE
-        # Static Mesh. Never an animation source.
-        box.label(text="Preview Mesh", icon='MESH_DATA')
-        row = box.row(align=True)
-        row.operator("wpn.set_preview_mesh", text="Set Preview",
+        layout.separator()
+        layout.label(text="Preview Mesh", icon='MESH_DATA')
+        row = layout.row(align=True)
+        row.operator("wpn.set_preview_mesh", text="Set",
                      icon='MESH_CUBE')
-        row.operator("wpn.clear_preview_mesh", text="Clear",
-                     icon='X')
+        row.operator("wpn.clear_preview_mesh", text="Clear", icon='X')
 
-        # ------------------------------------------------------------------
-        # Hands
-        # ------------------------------------------------------------------
-        box = layout.box()
-        box.label(text="Hands", icon='HAND')
 
-        col = box.column(align=True)
-        row = col.row(align=True)
-        row.operator("wpn.attach", text="Attach R").side = 'R'
-        row.operator("wpn.detach", text="Detach R").side = 'R'
-        row = col.row(align=True)
-        row.operator("wpn.attach", text="Attach L").side = 'L'
-        row.operator("wpn.detach", text="Detach L").side = 'L'
-        row = col.row(align=True)
-        row.operator("wpn.attach", text="Attach Both").side = 'BOTH'
-        row.operator("wpn.detach", text="Detach Both").side = 'BOTH'
+@_subpanel("Hands")
+class WPN_PT_hands(bpy.types.Panel):
+    bl_description = "Attach / detach hands, snap weapon to hands"
 
-        row = box.row(align=True)
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        arm = _arm(scene)
+        col = layout.column(align=True)
+        for side, label in (('R', "Right"), ('L', "Left")):
+            row = col.row(align=True)
+            attached = _attach_state(arm, side) if arm else False
+            row.label(text="%s: %s" % (
+                label, "Attached" if attached else "Free"),
+                icon='CHECKMARK' if attached else 'BLANK1')
+            op = row.operator("wpn.attach", text="Attach")
+            op.side = side
+            op = row.operator("wpn.detach", text="Detach")
+            op.side = side
+        row = col.row(align=True)
+        op = row.operator("wpn.attach", text="Attach Both")
+        op.side = 'BOTH'
+        op = row.operator("wpn.detach", text="Detach Both")
+        op.side = 'BOTH'
+
+        row = layout.row(align=True)
         row.label(text="Mode:")
         for mode in ('FREE', 'RIGHT', 'LEFT', 'BOTH'):
-            op = row.operator("wpn.set_mode", text=mode.capitalize(),
-                              icon='CHECKMARK' if scene.wpn_mode == mode
-                              else 'BLANK1')
+            op = row.operator("wpn.set_mode",
+                              text=mode.capitalize(),
+                              depress=(scene.wpn_mode == mode))
             op.mode = mode
 
-        # ------------------------------------------------------------------
-        # Snap (plan §18-20 -- Milestone 2)
-        # ------------------------------------------------------------------
-        box = layout.box()
-        box.label(text="Snap", icon='ORIENTATION_GLOBAL')
-        col = box.column(align=True)
-        op = col.operator("wpn.snap_to_hand", text="Weapon -> Right Hand")
+        layout.separator()
+        layout.label(text="Snap weapon to hands:", icon='SNAP_ON')
+        col = layout.column(align=True)
+        op = col.operator("wpn.snap_to_hand", text="To Right Hand")
         op.side = 'R'
-        op = col.operator("wpn.snap_to_hand", text="Weapon -> Left Hand")
+        op = col.operator("wpn.snap_to_hand", text="To Left Hand")
         op.side = 'L'
-        col.operator("wpn.snap_to_both",
-                     text="Weapon -> Both Hands")
+        col.operator("wpn.snap_to_both", text="To Both Hands")
 
-        # ------------------------------------------------------------------
-        # Pivot (plan §21-24 -- Milestone 3)
-        # ------------------------------------------------------------------
-        box = layout.box()
-        box.label(text="Pivot", icon='PIVOT_ACTIVE')
-        col = box.column(align=True)
-        row = col.row(align=True)
-        for preset, label in (('CENTER', "Center"),
-                              ('GRIP_R', "Grip R"),
-                              ('GRIP_L', "Grip L"),
-                              ('GUARD', "Guard")):
-            op = row.operator("wpn.select_pivot", text=label)
-            op.pivot = preset
-        row = col.row(align=True)
-        for preset, label in (('GUARD_L', "Guard L"),
-                              ('GUARD_R', "Guard R"),
-                              ('TIP', "Tip"),
-                              ('POMMEL', "Pommel")):
-            op = row.operator("wpn.select_pivot", text=label)
-            op.pivot = preset
-        row = col.row(align=True)
-        for preset, label in (('CURSOR', "3D Cursor"),
-                              ('CUSTOM', "Custom")):
-            op = row.operator("wpn.select_pivot", text=label)
-            op.pivot = preset
+
+@_subpanel("Pivot")
+class WPN_PT_pivot(bpy.types.Panel):
+    bl_description = "Pivot presets, Set Pivot, focus, orientation"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        arm = _arm(scene)
+        if arm is None:
+            layout.label(text="Create the rig first", icon='INFO')
+            return
+        # 3x3 spatial map as explicit rows (grid_flow collapses to one
+        # column on narrow sidebars; rows cannot). Row-major order:
+        # Guard | Tip | Cursor / Guard L | Center | Guard R /
+        # Grip L | Pommel | Grip R. Custom stays in the Rotate dropdown.
+        col = layout.column(align=True)
+        for presets in ((('GUARD', "Guard"),
+                         ('TIP', "Tip"),
+                         ('CURSOR', "Cursor")),
+                        (('GUARD_L', "Guard L"),
+                         ('CENTER', "Center"),
+                         ('GUARD_R', "Guard R")),
+                        (('GRIP_L', "Grip L"),
+                         ('POMMEL', "Pommel"),
+                         ('GRIP_R', "Grip R"))):
+            row = col.row(align=True)
+            for preset, label in presets:
+                op = row.operator("wpn.select_pivot", text=label,
+                                   depress=(scene.wpn_pivot == preset))
+                op.pivot = preset
         if scene.wpn_pivot == 'CUSTOM':
-            box.prop(scene, "wpn_pivot_custom", text="")
-        op = box.operator("wpn.set_pivot", text="Set Pivot",
+            layout.prop(scene, "wpn_pivot_custom", text="Custom Point")
+        row = layout.row(align=True)
+        op = row.operator("wpn.set_pivot", text="Set Pivot",
                           icon='PIVOT_ACTIVE')
         op.pivot = scene.wpn_pivot
-        box.operator("wpn.create_weapon_orientation",
-                     text="Create Orientation from Weapon",
-                     icon='ORIENTATION_LOCAL')
+        row.operator("wpn.create_weapon_orientation",
+                     text="Orientation", icon='ORIENTATION_LOCAL')
 
-        # ------------------------------------------------------------------
-        # Aim (plan §25-27 -- Milestone 4)
-        # ------------------------------------------------------------------
-        box = layout.box()
-        box.label(text="Aim", icon='ORIENTATION_VIEW')
-        row = box.row()
-        row.label(text="Target:")
-        row.label(text="weapon_aim")
-        col = box.column(align=True)
-        op = col.operator("wpn.aim_weapon", text="Aim Weapon",
-                          icon='TRACKING')
-        op.roll = scene.wpn_roll
-        op = col.operator("wpn.point_blade_at", text="Point Blade At",
-                          icon='CON_TRACKTO')
-        op.roll = scene.wpn_roll
-        row = box.row()
-        row.prop(scene, "wpn_roll", text="Roll")
-        op = row.operator("wpn.set_roll", text="Apply")
-        op.roll = scene.wpn_roll
-        box.operator("wpn.stop_aim", text="Stop Aim")
 
-        # ------------------------------------------------------------------
-        # Rotate (user-requested: pivot + drag interaction)
-        # ------------------------------------------------------------------
-        box = layout.box()
-        box.label(text="Rotate", icon='ORIENTATION_VIEW')
-        # Editable selectors (user request: "add selection") -- the same
-        # scene.wpn_pivot drives Set Pivot, so both stay in sync.
-        row = box.row(align=True)
-        row.prop(scene, "wpn_pivot", text="Pivot")
-        row.prop(scene, "wpn_drag", text="Drag")
+@_subpanel("Rotate")
+class WPN_PT_rotate(bpy.types.Panel):
+    bl_description = "Rotate weapon around the pivot"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        scene = context.scene
+        layout.prop(scene, "wpn_pivot", text="Pivot")
+        layout.prop(scene, "wpn_drag", text="Drag")
         handle = bpy.data.objects.get(scene.wpn_rot_handle or "")
         if handle is None:
-            box.operator("wpn.handle_create",
-                         text="Create Rotate Handle",
-                         icon='EMPTY_ARROWS')
+            layout.operator("wpn.handle_create",
+                            text="Create Rotate Handle",
+                            icon='EMPTY_ARROWS')
         else:
-            row = box.row(align=True)
-            sub = row.row(align=True)
-            sub.label(text="Handle: %s" % handle.name,
+            row = layout.row(align=True)
+            row.label(text="Handle: %s" % handle.name,
                       icon='EMPTY_ARROWS')
             row.operator("wpn.handle_remove", text="", icon='X')
             row.operator("wpn.handle_create", text="",
                          icon='FILE_REFRESH')
-        col = box.column(align=True)
+        col = layout.column(align=True)
         op = col.operator("wpn.rotate_to_cursor",
                           text="Rotate to Cursor", icon='CURSOR')
         op.pivot = scene.wpn_pivot
@@ -209,36 +228,67 @@ class WPN_PT_main(bpy.types.Panel):
         op.pivot = scene.wpn_pivot
         op.drag = scene.wpn_drag
 
-        # ------------------------------------------------------------------
-        # Bake (plan §44-45 -- Milestone 5)
-        # ------------------------------------------------------------------
-        box = layout.box()
-        box.label(text="Bake", icon='RENDER_ANIMATION')
-        row = box.row()
+
+@_subpanel("Aim", closed=True)
+class WPN_PT_aim(bpy.types.Panel):
+    bl_description = "Aim the weapon at weapon_aim"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        row = layout.row()
+        row.label(text="Target:")
+        row.label(text="weapon_aim")
+        col = layout.column(align=True)
+        op = col.operator("wpn.aim_weapon", text="Aim Weapon",
+                          icon='TRACKING')
+        op.roll = scene.wpn_roll
+        op = col.operator("wpn.point_blade_at", text="Point Blade At",
+                          icon='CON_TRACKTO')
+        op.roll = scene.wpn_roll
+        row = layout.row(align=True)
+        row.prop(scene, "wpn_roll", text="Roll")
+        op = row.operator("wpn.set_roll", text="Apply")
+        op.roll = scene.wpn_roll
+        layout.operator("wpn.stop_aim", text="Stop Aim")
+
+
+@_subpanel("Bake", closed=True)
+class WPN_PT_bake(bpy.types.Panel):
+    bl_description = "Bake weapon animation to keys"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        row = layout.row()
         row.label(text="Frame:")
         row.prop(scene, "frame_start", text="Start")
         row.prop(scene, "frame_end", text="End")
-        box.operator("wpn.bake", text="Bake Weapon Animation",
-                     icon='RENDER_ANIMATION')
+        layout.operator("wpn.bake", text="Bake Weapon Animation",
+                        icon='RENDER_ANIMATION')
 
-        # ------------------------------------------------------------------
-        # Debug
-        # ------------------------------------------------------------------
-        box = layout.box()
-        box.label(text="Debug", icon='VIEWZOOM')
-        row = box.row(align=True)
+
+@_subpanel("Debug", closed=True)
+class WPN_PT_debug(bpy.types.Panel):
+    bl_description = "Validation and reports"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        row = layout.row(align=True)
         row.operator("wpn.validate_rig", icon='FILE_TICK')
         op = row.operator("wpn.toggle_rig_visibility", icon='HIDE_OFF')
         op.show = True
         op = row.operator("wpn.toggle_rig_visibility", icon='HIDE_ON')
         op.show = False
         if scene.wpn_report:
-            col = box.column(align=True)
+            col = layout.column(align=True)
             for line in scene.wpn_report.split("\n"):
                 col.label(text=line)
 
 
-CLASSES = (WPN_PT_main,)
+CLASSES = (WPN_PT_main, WPN_PT_rig_setup, WPN_PT_hands, WPN_PT_pivot,
+           WPN_PT_rotate, WPN_PT_aim, WPN_PT_bake, WPN_PT_debug)
 
 
 def register():
