@@ -165,6 +165,13 @@ def register():
                     "(display only, never exported)",
         default=True,
     )
+    bpy.types.Scene.wpn_show_direct_snaps = BoolProperty(
+        name="Direct Snaps",
+        description="Show one-shot direct snaps (weapon to hand and "
+                    "hand to weapon). Only needed for the initial "
+                    "placement; daily work uses the Home slots",
+        default=False,
+    )
 
 
 def unregister():
@@ -180,4 +187,5 @@ def unregister():
     del bpy.types.Scene.wpn_preset_index
     del bpy.types.Scene.wpn_preset_name
     del bpy.types.Scene.wpn_show_grips
+    del bpy.types.Scene.wpn_show_direct_snaps
     bpy.utils.unregister_class(WPN_Preset)

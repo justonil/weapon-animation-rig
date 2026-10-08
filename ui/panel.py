@@ -147,14 +147,6 @@ class WPN_PT_hands(bpy.types.Panel):
             op.mode = mode
 
         layout.separator()
-        layout.label(text="Weapon to hand:", icon='SNAP_ON')
-        col = layout.column(align=True)
-        op = col.operator("wpn.snap_to_hand", text="To Right Hand")
-        op.side = 'R'
-        op = col.operator("wpn.snap_to_hand", text="To Left Hand")
-        op.side = 'L'
-        col.operator("wpn.snap_to_both", text="To Both Hands")
-
         layout.label(text="Weapon home (follows hand):", icon='BOOKMARKS')
         try:
             from ..weapon import snap as _snap_mod
@@ -176,13 +168,6 @@ class WPN_PT_hands(bpy.types.Panel):
             op = row.operator("wpn.snap_to_home", text="W: Home %s" % label)
             op.side = side
 
-        layout.label(text="Hand to weapon:", icon='BONE_DATA')
-        col = layout.column(align=True)
-        op = col.operator("wpn.snap_hand_to_weapon", text="To Weapon R")
-        op.side = 'R'
-        op = col.operator("wpn.snap_hand_to_weapon", text="To Weapon L")
-        op.side = 'L'
-
         layout.label(text="Hand home (follows weapon):", icon='BOOKMARKS')
         col = layout.column(align=True)
         for side, label in (('R', "R"), ('L', "L")):
@@ -201,6 +186,28 @@ class WPN_PT_hands(bpy.types.Panel):
             op = row.operator("wpn.snap_hand_to_home",
                               text="H: Home %s" % label)
             op.side = side
+
+        row = layout.row(align=True)
+        row.prop(scene, "wpn_show_direct_snaps", text="",
+                 icon='TRIA_DOWN' if scene.wpn_show_direct_snaps
+                 else 'TRIA_RIGHT', emboss=False)
+        row.label(text="Direct snaps (first placement only)")
+        if scene.wpn_show_direct_snaps:
+            layout.label(text="Weapon to hand:", icon='SNAP_ON')
+            col = layout.column(align=True)
+            op = col.operator("wpn.snap_to_hand", text="To Right Hand")
+            op.side = 'R'
+            op = col.operator("wpn.snap_to_hand", text="To Left Hand")
+            op.side = 'L'
+            col.operator("wpn.snap_to_both", text="To Both Hands")
+            layout.label(text="Hand to weapon:", icon='BONE_DATA')
+            col = layout.column(align=True)
+            op = col.operator("wpn.snap_hand_to_weapon",
+                              text="To Weapon R")
+            op.side = 'R'
+            op = col.operator("wpn.snap_hand_to_weapon",
+                              text="To Weapon L")
+            op.side = 'L'
 
 
 @_subpanel("Pivot")
