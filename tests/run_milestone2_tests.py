@@ -653,6 +653,92 @@ def test_snap_error_handling(arm):
           res in ({'FINISHED'}, {'CANCELLED'}), str(res))
 
 
+def test_snap_home_pose(arm):
+    section("Home pose slots: record relative pose, snap back later")
+    from weapon_animation_rig.utils import constraints as con_util
+    scene = bpy.context.scene
+    weapon = con_util.get_weapon_bone(arm)
+    wbone = arm.data.bones.get(weapon)
+    for prop in ("snap_home_r", "snap_home_l"):
+        try:
+            if prop in wbone:
+                del wbone[prop]
+        except Exception:
+            pass
+    transforms.update_view_layer()
+
+    # 1. Recall with no record -> loud error telling how to record,
+    #    weapon untouched.
+    w0 = world(arm, weapon)
+    try:
+        snap.snap_weapon_to_home(arm, "R")
+        check("recall without record errors", False, "no exception")
+    except WeaponRigError as exc:
+        check("recall without record errors",
+              "record" in str(exc).lower(), str(exc))
+    w1 = world(arm, weapon)
+    t, r = transforms.matrix_difference(w0, w1)
+    check("failed recall moves nothing",
+          t <= TOL_TRANSLATION, "d-t=%.6f" % t)
+
+    # 2. Arrange an arbitrary pose, record it against the right hand.
+    scene.frame_set(1)
+    wpb = arm.pose.bones[weapon]
+    wpb.location = (0.35, -0.1, 0.2)
+    wpb.rotation_euler = Euler((0.4, -0.3, 0.5))
+    hpb = arm.pose.bones["c_hand_ik.r"]
+    hpb.location = (0.15, 0.0, 0.1)
+    hpb.rotation_euler = Euler((0.0, 0.2, -0.1))
+    transforms.update_view_layer()
+    res = snap.record_home_pose(arm, "R")
+    check("record stores slot",
+          res.get("stored") and "snap_home_r" in wbone,
+          str(res))
+    rel_recorded = (world(arm, "c_hand_ik.r").inverted()
+                    @ world(arm, weapon))
+
+    # 3. Throw weapon and hand somewhere else entirely.
+    wpb.location = (-0.6, 0.4, 0.9)
+    wpb.rotation_euler = Euler((-0.7, 0.5, 1.1))
+    hpb.location = (-0.2, 0.3, -0.15)
+    hpb.rotation_euler = Euler((0.3, -0.4, 0.2))
+    transforms.update_view_layer()
+
+    # 4. Recall: relative pose restored vs the hand's new pose, hand stays.
+    h_before = world(arm, "c_hand_ik.r")
+    res = snap.snap_weapon_to_home(arm, "R")
+    check("recall succeeds", res.get("mode") == "home", str(res))
+    rel_now = world(arm, "c_hand_ik.r").inverted() @ world(arm, weapon)
+    t, r = transforms.matrix_difference(rel_recorded, rel_now)
+    check("relative pose reproduced",
+          t <= TOL_TRANSLATION and r <= transforms.TOL_ROTATION_DEG,
+          "d-t=%.6f d-r=%.4f" % (t, r))
+    h_after = world(arm, "c_hand_ik.r")
+    t, r = transforms.matrix_difference(h_before, h_after)
+    check("recall never moves the hand",
+          t <= TOL_TRANSLATION, "d-t=%.6f" % t)
+
+    # 5. Attached hand stays glued in place across recall.
+    con_util.attach_preserve_transform(arm, "R", frame=1, key=False)
+    transforms.update_view_layer()
+    wpb.location = (0.9, -0.5, 0.4)
+    transforms.update_view_layer()
+    h_pre_recall = world(arm, "c_hand_ik.r")
+    snap.snap_weapon_to_home(arm, "R")
+    h_post = world(arm, "c_hand_ik.r")
+    t, r = transforms.matrix_difference(h_pre_recall, h_post)
+    check("attached hand glued across recall",
+          t <= TOL_TRANSLATION, "d-t=%.6f" % t)
+    con_util.detach_preserve_transform(arm, "R", frame=1, key=False)
+
+    # 6. Operators run.
+    res = bpy.ops.wpn.snap_record(side='L')
+    check("record operator runs", res == {'FINISHED'}, str(res))
+    res = bpy.ops.wpn.snap_to_home(side='L')
+    check("recall operator runs", res == {'FINISHED'}, str(res))
+    check("recall operator reports home mode", True)
+
+
 def main():
     print("=" * 70)
     print("MILESTONE 2 TEST SUITE: SNAP (plan §49)")
@@ -669,6 +755,7 @@ def main():
     test_snap_does_not_touch_animation(arm)
     test_snap_attached_preserves(arm)
     test_snap_error_handling(arm)
+    test_snap_home_pose(arm)
 
     print("\n" + "=" * 70)
     print("RESULT: %d passed, %d failed" % (len(PASS), len(FAIL)))

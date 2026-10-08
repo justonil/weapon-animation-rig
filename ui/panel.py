@@ -155,6 +155,27 @@ class WPN_PT_hands(bpy.types.Panel):
         op.side = 'L'
         col.operator("wpn.snap_to_both", text="To Both Hands")
 
+        layout.label(text="Home pose (relative):", icon='BOOKMARKS')
+        try:
+            from ..weapon import snap as _snap_mod
+        except Exception:
+            _snap_mod = None
+        col = layout.column(align=True)
+        for side, label in (('R', "R"), ('L', "L")):
+            row = col.row(align=True)
+            stored = False
+            if arm is not None and _snap_mod is not None:
+                try:
+                    stored = _snap_mod.has_home_pose(arm, side)
+                except Exception:
+                    stored = False
+            row.label(text="", icon='CHECKMARK' if stored
+                      else 'BLANK1')
+            op = row.operator("wpn.snap_record", text="Record %s" % label)
+            op.side = side
+            op = row.operator("wpn.snap_to_home", text="Home %s" % label)
+            op.side = side
+
 
 @_subpanel("Pivot")
 class WPN_PT_pivot(bpy.types.Panel):

@@ -109,9 +109,88 @@ class WPN_OT_snap_to_both(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WPN_OT_snap_record(bpy.types.Operator):
+    """Record the weapon pose relative to a hand (home slot)."""
+    bl_idname = "wpn.snap_record"
+    bl_label = "Record Home Pose"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    side: bpy.props.EnumProperty(
+        name="Side",
+        items=[('R', "Right", "Record relative to the right hand"),
+               ('L', "Left", "Record relative to the left hand")],
+        default='R',
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    def execute(self, context):
+        try:
+            armature = resolve_armature(context)
+        except WeaponRigError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        try:
+            snap.record_home_pose(armature, self.side)
+        except WeaponRigError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Home pose recorded (%s hand)." % (
+            "right" if self.side == 'R' else "left"))
+        return {'FINISHED'}
+
+
+class WPN_OT_snap_to_home(bpy.types.Operator):
+    """Snap the weapon back to its recorded home pose (relative)."""
+    bl_idname = "wpn.snap_to_home"
+    bl_label = "Snap to Home Pose"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    side: bpy.props.EnumProperty(
+        name="Side",
+        items=[('R', "Right", "Recall the right-hand home pose"),
+               ('L', "Left", "Recall the left-hand home pose")],
+        default='R',
+    )
+    key: bpy.props.BoolProperty(
+        name="Key",
+        description="Keyframe the weapon bone (also implied by Blender's "
+                    "Auto Key, plan §31)",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    def execute(self, context):
+        try:
+            armature = resolve_armature(context)
+        except WeaponRigError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        try:
+            result = snap.snap_weapon_to_home(
+                armature, self.side,
+                key=_effective_key(context.scene, self.key),
+                frame=context.scene.frame_current)
+        except WeaponRigError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        if result["warning"]:
+            self.report({'WARNING'}, result["warning"])
+        self.report({'INFO'}, "Snapped weapon -> home pose (%s hand)." % (
+            "right" if self.side == 'R' else "left"))
+        return {'FINISHED'}
+
+
 CLASSES = (
     WPN_OT_snap_to_hand,
     WPN_OT_snap_to_both,
+    WPN_OT_snap_record,
+    WPN_OT_snap_to_home,
 )
 
 

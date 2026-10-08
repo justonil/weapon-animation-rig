@@ -85,6 +85,13 @@ EPS_HAND_DISTANCE = 1e-6
 # Frame fallback: projection considered degenerate below this fraction.
 _EPS_PROJ = 1e-4
 
+# Home-pose slots: weapon transform relative to a hand (H^-1 @ W),
+# stored as 16 row-major floats in weapon-bone custom props. Relative
+# storage follows the hand: recall restores the recorded spatial
+# relationship against the hand's CURRENT pose. Re-record after editing
+# grip offsets (they change what the stored relationship means).
+HOME_PROP = {"R": "snap_home_r", "L": "snap_home_l"}
+
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -380,6 +387,138 @@ def snap_weapon_to_both(armature, key=False, frame=None):
         "grip_error_l": err_l,
         "keyed": bool(key),
         "warning": warning,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Home pose slots: record a relative pose, snap back to it later
+# ---------------------------------------------------------------------------
+
+def _home_prop_name(side):
+    try:
+        return HOME_PROP[side]
+    except KeyError:
+        raise WeaponRigError("Unknown hand side: %s." % side)
+
+
+def has_home_pose(armature, side):
+    """True when a home slot is stored for ``side`` (pure read)."""
+    from ..utils import constraints as con_util
+    weapon = con_util.get_weapon_bone(armature)
+    wbone = armature.data.bones.get(weapon)
+    return wbone is not None and _home_prop_name(side) in wbone
+
+
+def record_home_pose(armature, side):
+    """Store the weapon transform relative to the hand (H^-1 @ W).
+
+    Arrange the weapon by hand first (any pose: angled in the palm,
+    resting on fingers, ...) then record. Recall reproduces exactly this
+    relative pose against the hand's pose at recall time. No keys, no
+    animation touched -- pure data write. Returns diagnostics.
+    """
+    hand = HAND_BONES[side]
+    from ..utils import constraints as con_util
+    weapon = con_util.get_weapon_bone(armature)
+    _require_bone(armature, hand, "arp")
+
+    dg = transforms.evaluated_depsgraph()
+    h_world = _world(armature, hand, dg)
+    w_world = _world(armature, weapon, dg)
+    rel = h_world.inverted() @ w_world
+    wbone = armature.data.bones.get(weapon)
+    if wbone is None:
+        raise missing_weapon_bone(weapon)
+    wbone[_home_prop_name(side)] = [float(v) for row in rel
+                                     for v in row]
+    return {"mode": "record", "side": side, "stored": True}
+
+
+def _read_home_rel(armature, side):
+    """Stored relative matrix or a loud error telling how to record it."""
+    from ..utils import constraints as con_util
+    weapon = con_util.get_weapon_bone(armature)
+    wbone = armature.data.bones.get(weapon)
+    prop = _home_prop_name(side)
+    if wbone is None or prop not in wbone:
+        raise WeaponRigError(
+            "No home pose recorded for the %s hand. Arrange the weapon "
+            "and press Record Home first."
+            % ("right" if side == 'R' else "left"))
+    try:
+        vals = [float(v) for v in wbone[prop]]
+    except Exception:
+        vals = []
+    if len(vals) != 16:
+        raise WeaponRigError(
+            "Home pose slot for the %s hand is corrupt (%d values, "
+            "need 16). Re-record it."
+            % (("right" if side == 'R' else "left"), len(vals)))
+    return Matrix((vals[0:4], vals[4:8], vals[8:12], vals[12:16]))
+
+
+def snap_weapon_to_home(armature, side, key=False, frame=None):
+    """Return the weapon to its recorded home pose relative to the hand.
+
+    Target = current hand world @ stored relative matrix: the exact
+    recorded spatial relationship, reproduced against wherever the hand
+    is now. Attached hands are re-glued in place (never chase), hands
+    and hand animation are never touched. Rollback + loud error on any
+    mismatch; keys only when ``key=True`` (plan §31).
+    """
+    hand = HAND_BONES[side]
+    from ..utils import constraints as con_util
+    weapon = con_util.get_weapon_bone(armature)
+    _require_bone(armature, hand, "arp")
+    rel = _read_home_rel(armature, side)
+
+    if frame is None:
+        frame = bpy.context.scene.frame_current
+
+    dg = transforms.evaluated_depsgraph()
+    w_before = _world(armature, weapon, dg)
+    h_now = _world(armature, hand, dg)
+    hands_before = _capture_hands(armature, dg)
+    w_target = h_now @ rel
+
+    from ..animation import keyframes
+    old_channels = keyframes.capture_channels(armature, weapon)
+    _apply_weapon(armature, w_target)
+    _preserve_hands(armature, hands_before)
+
+    # --- verification (plan §30) ----------------------------------------
+    w_after = _world(armature, weapon)
+    t_err, r_err = transforms.matrix_difference(w_after, w_target)
+    problems = []
+    if t_err > TOL_TRANSLATION:
+        problems.append("weapon missed home pose by %.6f" % t_err)
+    if r_err > transforms.TOL_ROTATION_DEG:
+        problems.append("weapon rotation off home by %.4f deg" % r_err)
+    for sname, hb in (("R", HAND_BONES["R"]),
+                       ("L", HAND_BONES["L"])):
+        now = _world(armature, hb)
+        moved = (now.translation
+                 - hands_before[sname].translation).length
+        if moved > TOL_TRANSLATION:
+            problems.append("hand %s moved %.6f (must not)"
+                            % (sname, moved))
+
+    if problems:
+        _apply_weapon(armature, w_before)  # rollback
+        raise WeaponRigError(
+            "Snap weapon -> home pose (%s) failed: %s."
+            % (hand, "; ".join(problems)))
+
+    if key:
+        _key_weapon(armature, frame, old_channels)
+
+    return {
+        "mode": "home",
+        "side": side,
+        "error_t": t_err,
+        "error_r": r_err,
+        "keyed": bool(key),
+        "warning": None,
     }
 
 
