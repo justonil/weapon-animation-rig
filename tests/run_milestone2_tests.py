@@ -739,6 +739,114 @@ def test_snap_home_pose(arm):
     check("recall operator reports home mode", True)
 
 
+def test_snap_hand_to_weapon(arm):
+    section("Hand -> weapon: detached hand travels onto the grip")
+    from weapon_animation_rig.utils import constraints as con_util
+    weapon = con_util.get_weapon_bone(arm)
+    wbone = arm.data.bones.get(weapon)
+    for prop in ("hand_home_r", "hand_home_l"):
+        try:
+            if prop in wbone:
+                del wbone[prop]
+        except Exception:
+            pass
+    for side in ("R", "L"):
+        try:
+            con_util.detach_preserve_transform(arm, side, frame=1,
+                                               key=False)
+        except Exception:
+            pass
+    transforms.update_view_layer()
+
+    # 1. Hand onto grip: position matches, weapon + other hand untouched.
+    hpb = arm.pose.bones["c_hand_ik.r"]
+    hpb.location = (0.4, -0.3, 0.5)
+    hpb.rotation_euler = Euler((0.2, 0.5, -0.3))
+    transforms.update_view_layer()
+    w0 = world(arm, weapon)
+    l0 = world(arm, "c_hand_ik.l")
+    res = snap.snap_hand_to_weapon(arm, "R")
+    check("hand snap succeeds", res.get("mode") == "hand", str(res))
+    grip = grip_world(arm, "R")
+    h1 = world(arm, "c_hand_ik.r")
+    t = (h1.translation - grip.translation).length
+    check("hand lands on grip", t <= TOL_TRANSLATION, "d=%.6f" % t)
+    w1 = world(arm, weapon)
+    t, r = transforms.matrix_difference(w0, w1)
+    check("weapon frozen during hand snap",
+          t <= TOL_TRANSLATION and r <= transforms.TOL_ROTATION_DEG,
+          "d-t=%.6f d-r=%.4f" % (t, r))
+    l1 = world(arm, "c_hand_ik.l")
+    t, r = transforms.matrix_difference(l0, l1)
+    check("other hand untouched", t <= TOL_TRANSLATION, "d-t=%.6f" % t)
+
+    # 2. Attached hand -> loud error, nothing moved.
+    con_util.attach_preserve_transform(arm, "R", frame=1, key=False)
+    transforms.update_view_layer()
+    h_att = world(arm, "c_hand_ik.r")
+    try:
+        snap.snap_hand_to_weapon(arm, "R")
+        check("attached hand snap errors", False, "no exception")
+    except WeaponRigError as exc:
+        check("attached hand snap errors",
+              "detach" in str(exc).lower(), str(exc))
+    h_att2 = world(arm, "c_hand_ik.r")
+    t, r = transforms.matrix_difference(h_att, h_att2)
+    check("refused snap moves nothing", t <= TOL_TRANSLATION,
+          "d-t=%.6f" % t)
+    con_util.detach_preserve_transform(arm, "R", frame=1, key=False)
+    transforms.update_view_layer()
+
+    # 3. Hand home slots: record, move both, recall reproduces G^-1 H.
+    hpb.location = (0.2, 0.1, -0.2)
+    hpb.rotation_euler = Euler((-0.3, 0.4, 0.1))
+    transforms.update_view_layer()
+    res = snap.record_hand_home(arm, "R")
+    check("hand home recorded",
+          res.get("stored") and "hand_home_r" in wbone, str(res))
+    rel0 = grip_world(arm, "R").inverted() @ world(arm, "c_hand_ik.r")
+    wpb = arm.pose.bones[weapon]
+    wpb.location = (0.7, 0.2, -0.4)
+    wpb.rotation_euler = Euler((0.6, -0.5, 0.3))
+    hpb.location = (-0.4, 0.5, 0.6)
+    transforms.update_view_layer()
+    res = snap.snap_hand_to_home(arm, "R")
+    check("hand home recall succeeds",
+          res.get("mode") == "hand-home", str(res))
+    rel1 = grip_world(arm, "R").inverted() @ world(arm, "c_hand_ik.r")
+    # Elementwise 3x3 (immune to the q/-q double-cover that reports 360
+    # deg for an identical rotation).
+    t = (rel1.translation - rel0.translation).length
+    r3d, r3s = rel1.to_3x3(), rel0.to_3x3()
+    r = max(abs(x - y) for rd, rs in zip(r3d, r3s)
+            for x, y in zip(rd, rs))
+    check("hand relative pose reproduced",
+          t <= TOL_TRANSLATION and r <= 1e-4,
+          "d-t=%.6f d-3x3=%.6f" % (t, r))
+
+    # 4. Recall with no record -> loud error.
+    try:
+        if "hand_home_l" in wbone:
+            del wbone["hand_home_l"]
+    except Exception:
+        pass
+    transforms.update_view_layer()
+    try:
+        snap.snap_hand_to_home(arm, "L")
+        check("hand recall without record errors", False, "no exception")
+    except WeaponRigError as exc:
+        check("hand recall without record errors",
+              "record" in str(exc).lower(), str(exc))
+
+    # 5. Operators run.
+    res = bpy.ops.wpn.snap_hand_to_weapon(side='R')
+    check("hand snap operator runs", res == {'FINISHED'}, str(res))
+    res = bpy.ops.wpn.hand_home_record(side='L')
+    check("hand record operator runs", res == {'FINISHED'}, str(res))
+    res = bpy.ops.wpn.snap_hand_to_home(side='L')
+    check("hand recall operator runs", res == {'FINISHED'}, str(res))
+
+
 def main():
     print("=" * 70)
     print("MILESTONE 2 TEST SUITE: SNAP (plan §49)")
@@ -756,6 +864,7 @@ def main():
     test_snap_attached_preserves(arm)
     test_snap_error_handling(arm)
     test_snap_home_pose(arm)
+    test_snap_hand_to_weapon(arm)
 
     print("\n" + "=" * 70)
     print("RESULT: %d passed, %d failed" % (len(PASS), len(FAIL)))

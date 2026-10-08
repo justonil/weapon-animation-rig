@@ -147,7 +147,7 @@ class WPN_PT_hands(bpy.types.Panel):
             op.mode = mode
 
         layout.separator()
-        layout.label(text="Snap weapon to hands:", icon='SNAP_ON')
+        layout.label(text="Weapon to hand:", icon='SNAP_ON')
         col = layout.column(align=True)
         op = col.operator("wpn.snap_to_hand", text="To Right Hand")
         op.side = 'R'
@@ -155,7 +155,7 @@ class WPN_PT_hands(bpy.types.Panel):
         op.side = 'L'
         col.operator("wpn.snap_to_both", text="To Both Hands")
 
-        layout.label(text="Home pose (relative):", icon='BOOKMARKS')
+        layout.label(text="Weapon home (follows hand):", icon='BOOKMARKS')
         try:
             from ..weapon import snap as _snap_mod
         except Exception:
@@ -171,9 +171,35 @@ class WPN_PT_hands(bpy.types.Panel):
                     stored = False
             row.label(text="", icon='CHECKMARK' if stored
                       else 'BLANK1')
-            op = row.operator("wpn.snap_record", text="Record %s" % label)
+            op = row.operator("wpn.snap_record", text="W: Record %s" % label)
             op.side = side
-            op = row.operator("wpn.snap_to_home", text="Home %s" % label)
+            op = row.operator("wpn.snap_to_home", text="W: Home %s" % label)
+            op.side = side
+
+        layout.label(text="Hand to weapon:", icon='BONE_DATA')
+        col = layout.column(align=True)
+        op = col.operator("wpn.snap_hand_to_weapon", text="To Weapon R")
+        op.side = 'R'
+        op = col.operator("wpn.snap_hand_to_weapon", text="To Weapon L")
+        op.side = 'L'
+
+        layout.label(text="Hand home (follows weapon):", icon='BOOKMARKS')
+        col = layout.column(align=True)
+        for side, label in (('R', "R"), ('L', "L")):
+            row = col.row(align=True)
+            stored = False
+            if arm is not None and _snap_mod is not None:
+                try:
+                    stored = _snap_mod.has_hand_home(arm, side)
+                except Exception:
+                    stored = False
+            row.label(text="", icon='CHECKMARK' if stored
+                      else 'BLANK1')
+            op = row.operator("wpn.hand_home_record",
+                              text="H: Record %s" % label)
+            op.side = side
+            op = row.operator("wpn.snap_hand_to_home",
+                              text="H: Home %s" % label)
             op.side = side
 
 

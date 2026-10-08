@@ -578,3 +578,227 @@ def _fallback_right_hand_only(armature, hr, d_local, lr, w_before,
         "keyed": bool(key),
         "warning": None,  # set by caller
     }
+
+
+
+
+# ---------------------------------------------------------------------------
+# Hand -> weapon direction (+ hand home slots)
+#
+# Mirror of the weapon snaps: the WEAPON stays frozen, the detached hand
+# travels onto the grip. Refuses attached hands loudly (moving one would
+# fight its Child Of). Hand IK solvers are frozen for the write exactly
+# like in attach (plan §53 lesson): if the solver disagrees with the
+# target, verification catches it instead of a silent pop.
+# ---------------------------------------------------------------------------
+
+HAND_HOME_PROP = {"R": "hand_home_r", "L": "hand_home_l"}
+
+
+def _apply_hand(armature, side, world_matrix):
+    """Write a hand bone's world matrix via the pose-matrix setter."""
+    arm_space = armature.matrix_world.inverted() @ world_matrix
+    transforms.set_pose_bone_arm_matrix(
+        armature, HAND_BONES[side], arm_space)
+    transforms.update_view_layer()
+
+
+def _freeze_hand_ik(armature, side):
+    """Disable IK solvers on the hand; returns [(constraint, was_active)]."""
+    pbone = armature.pose.bones[HAND_BONES[side]]
+    saved = [(c, c.active) for c in pbone.constraints if c.type == 'IK']
+    for c, _old in saved:
+        c.active = False
+    return saved
+
+
+def _restore_hand_ik(saved):
+    for c, old in saved:
+        c.active = old
+
+
+def _require_detached(armature, side):
+    """Hands glued by Child Of must not be posed by hand-snap."""
+    from ..utils import constraints as con_util
+    con = con_util.find_attach_constraint(armature, side)
+    if con is not None and con.influence > 0.0:
+        raise WeaponRigError(
+            "Hand %s is attached (influence %.2f) -- Detach it first, "
+            "then snap the hand to the weapon." % (side, con.influence))
+
+
+def _move_hand(armature, side, h_target, key, frame, label):
+    """Shared hand-move pipeline: freeze IK, write, verify, rollback, key."""
+    from ..utils import constraints as con_util
+    weapon = con_util.get_weapon_bone(armature)
+    other = "L" if side == "R" else "R"
+
+    dg = transforms.evaluated_depsgraph()
+    h_before = _world(armature, HAND_BONES[side], dg)
+    w_before = _world(armature, weapon, dg)
+    other_before = _world(armature, HAND_BONES[other], dg)
+
+    frozen = _freeze_hand_ik(armature, side)
+    try:
+        from ..animation import keyframes
+        old_channels = keyframes.capture_channels(
+            armature, HAND_BONES[side])
+        _apply_hand(armature, side, h_target)
+    finally:
+        _restore_hand_ik(frozen)
+    transforms.update_view_layer()
+
+    h_after = _world(armature, HAND_BONES[side])
+    t_err, r_err = transforms.matrix_difference(h_after, h_target)
+    w_after = _world(armature, weapon)
+    wt_err, wr_err = transforms.matrix_difference(w_after, w_before)
+    o_after = _world(armature, HAND_BONES[other])
+    o_err = (o_after.translation - other_before.translation).length
+    problems = []
+    if t_err > TOL_TRANSLATION:
+        problems.append("hand missed target by %.6f" % t_err)
+    if r_err > transforms.TOL_ROTATION_DEG:
+        problems.append("hand rotation off by %.4f deg" % r_err)
+    if wt_err > TOL_TRANSLATION or wr_err > transforms.TOL_ROTATION_DEG:
+        problems.append("weapon moved (must not)")
+    if o_err > TOL_TRANSLATION:
+        problems.append("other hand moved %.6f (must not)" % o_err)
+
+    if problems:
+        frozen = _freeze_hand_ik(armature, side)
+        try:
+            _apply_hand(armature, side, h_before)
+        finally:
+            _restore_hand_ik(frozen)
+        transforms.update_view_layer()
+        raise WeaponRigError(
+            "Snap hand -> weapon (%s) failed: %s."
+            % (label, "; ".join(problems)))
+
+    if key:
+        from ..animation import keyframes as _kf
+        _kf.key_changed_channels(armature, HAND_BONES[side], frame,
+                                 old_channels)
+
+    return {
+        "mode": label,
+        "side": side,
+        "error_t": t_err,
+        "error_r": r_err,
+        "keyed": bool(key),
+        "warning": None,
+    }
+
+
+def snap_hand_to_weapon(armature, side, align_orientation=False,
+                        key=False, frame=None):
+    """Move the detached hand onto the weapon's grip point.
+
+    Default: position only, hand orientation preserved. With
+    ``align_orientation=True`` the hand frame matches the weapon frame.
+    The weapon, the other hand and all animation are untouched; keys only
+    when ``key=True`` (plan §31).
+    """
+    hand = HAND_BONES[side]
+    from ..utils import constraints as con_util
+    con_util.get_weapon_bone(armature)
+    _require_bone(armature, hand, "arp")
+    _require_detached(armature, side)
+
+    if frame is None:
+        frame = bpy.context.scene.frame_current
+
+    dg = transforms.evaluated_depsgraph()
+    h_before = _world(armature, hand, dg)
+    grip = con_util.grip_world(armature, side)
+    if align_orientation:
+        w_now = _world(armature, con_util.get_weapon_bone(armature), dg)
+        h_target = w_now.copy()
+        h_target.translation = grip.translation.copy()
+    else:
+        h_target = h_before.copy()
+        h_target.translation = grip.translation.copy()
+
+    return _move_hand(armature, side, h_target, key, frame, "hand")
+
+
+def _hand_home_prop_name(side):
+    try:
+        return HAND_HOME_PROP[side]
+    except KeyError:
+        raise WeaponRigError("Unknown hand side: %s." % side)
+
+
+def has_hand_home(armature, side):
+    """True when a hand home slot is stored for ``side`` (pure read)."""
+    from ..utils import constraints as con_util
+    weapon = con_util.get_weapon_bone(armature)
+    wbone = armature.data.bones.get(weapon)
+    return wbone is not None and _hand_home_prop_name(side) in wbone
+
+
+def record_hand_home(armature, side):
+    """Store the hand transform relative to the grip (G^-1 @ H).
+
+    Arrange the hand by hand first, then record. Recall reproduces exactly
+    this relative pose against the grip's pose at recall time. No keys, no
+    animation touched -- pure data write.
+    """
+    hand = HAND_BONES[side]
+    from ..utils import constraints as con_util
+    weapon = con_util.get_weapon_bone(armature)
+    _require_bone(armature, hand, "arp")
+
+    dg = transforms.evaluated_depsgraph()
+    grip = con_util.grip_world(armature, side)
+    h_world = _world(armature, hand, dg)
+    rel = grip.inverted() @ h_world
+    wbone = armature.data.bones.get(weapon)
+    if wbone is None:
+        raise missing_weapon_bone(weapon)
+    wbone[_hand_home_prop_name(side)] = [float(v) for row in rel
+                                         for v in row]
+    return {"mode": "record-hand", "side": side, "stored": True}
+
+
+def _read_hand_home_rel(armature, side):
+    from ..utils import constraints as con_util
+    weapon = con_util.get_weapon_bone(armature)
+    wbone = armature.data.bones.get(weapon)
+    prop = _hand_home_prop_name(side)
+    if wbone is None or prop not in wbone:
+        raise WeaponRigError(
+            "No hand home pose recorded for the %s hand. Arrange the "
+            "hand and press Record Hand first."
+            % ("right" if side == 'R' else "left"))
+    try:
+        vals = [float(v) for v in wbone[prop]]
+    except Exception:
+        vals = []
+    if len(vals) != 16:
+        raise WeaponRigError(
+            "Hand home slot for the %s hand is corrupt (%d values, need "
+            "16). Re-record it."
+            % (("right" if side == 'R' else "left"), len(vals)))
+    return Matrix((vals[0:4], vals[4:8], vals[8:12], vals[12:16]))
+
+
+def snap_hand_to_home(armature, side, key=False, frame=None):
+    """Return the hand to its recorded home pose relative to the grip.
+
+    Target = current grip frame @ stored relative matrix. Attached hands
+    are refused (detach first); weapon, other hand and animation are
+    untouched; rollback + loud error on mismatch; keys only with key=True.
+    """
+    hand = HAND_BONES[side]
+    from ..utils import constraints as con_util
+    con_util.get_weapon_bone(armature)
+    _require_bone(armature, hand, "arp")
+    _require_detached(armature, side)
+    rel = _read_hand_home_rel(armature, side)
+
+    if frame is None:
+        frame = bpy.context.scene.frame_current
+
+    grip = con_util.grip_world(armature, side)
+    return _move_hand(armature, side, grip @ rel, key, frame, "hand-home")
