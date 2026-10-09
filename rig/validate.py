@@ -28,6 +28,7 @@ from ..constants import (
     LEGACY_NAMES,
     POMMEL_PROP,
     TIP_PROP,
+    WeaponRigError,
 )
 from ..utils import armature as arm_util
 from ..utils import constraints as con_util
@@ -110,32 +111,55 @@ def validate_weapon_rig(armature):
                           "" if parent == char_root
                           else " -- expected %s" % char_root)))
 
-    # Attachment constraints (plan §9): exactly one per side, CHILD_OF,
+    # Attachment constraints (plan §9): exactly one MAIN per side, CHILD_OF,
     # targeting armature + the weapon bone, no duplicates (plan §41).
+    # History segments (WPN_Attach_*_segN, one inverse per attach range)
+    # are allowed alongside: each must be CHILD_OF aimed at the weapon.
     for side in ("R", "L"):
         con_name = ATTACH_CONSTRAINT[side]
         hand = HAND_BONES[side]
         pbone = armature.pose.bones.get(hand)
         count = con_util.count_attach_constraints(armature, side)
         label = "%s on %s" % (con_name, hand)
-        if pbone is None or count == 0:
+        if pbone is None or (count == 0
+                             and not con_util.find_attach_segments(
+                                 armature, side)):
             checks.append((False, label + " (missing)"))
             continue
         if count > 1:
             checks.append((False, label + " (DUPLICATE x%d)" % count))
             continue
-        con = pbone.constraints.get(con_name)
-        problems = []
-        if con.type != 'CHILD_OF':
-            problems.append("type=%s" % con.type)
-        if con.target is not armature:
-            problems.append("target=%s" % (con.target.name if con.target else "None"))
-        if con.subtarget != BONE_WEAPON:
-            problems.append("subtarget=%s (expected %s)"
-                            % (con.subtarget, BONE_WEAPON))
-        checks.append((not problems,
-                       label + (" OK" if not problems else
-                                " (%s)" % "; ".join(problems))))
+        if count == 1:
+            con = pbone.constraints.get(con_name)
+            problems = []
+            if con.type != 'CHILD_OF':
+                problems.append("type=%s" % con.type)
+            if con.target is not armature:
+                problems.append("target=%s" % (con.target.name if con.target else "None"))
+            if con.subtarget != BONE_WEAPON:
+                problems.append("subtarget=%s (expected %s)"
+                                % (con.subtarget, BONE_WEAPON))
+            checks.append((not problems,
+                           label + (" OK" if not problems else
+                                    " (%s)" % "; ".join(problems))))
+        try:
+            segs = con_util.find_attach_segments(armature, side)
+        except WeaponRigError as exc:
+            checks.append((False, "%s segments (%s)" % (label, exc)))
+            continue
+        for seg in segs:
+            seg_problems = []
+            if seg.target is not armature:
+                seg_problems.append(
+                    "target=%s" % (seg.target.name if seg.target
+                                    else "None"))
+            if seg.subtarget != BONE_WEAPON:
+                seg_problems.append("subtarget=%s (expected %s)"
+                                    % (seg.subtarget, BONE_WEAPON))
+            checks.append((not seg_problems,
+                           "%s on %s" % (seg.name, hand) + (
+                               " OK" if not seg_problems else
+                               " (%s)" % "; ".join(seg_problems))))
 
     return all(ok for ok, _ in checks), _format(checks)
 

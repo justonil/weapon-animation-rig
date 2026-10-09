@@ -53,6 +53,15 @@ class _WPN_AttachDetachBase:
             self.report({'INFO'}, "Already %sd -- no change"
                         % self.action)
         if self.action == "attach":
+            segs = [(r["side"], r.get("segment")) for r in results
+                    if r.get("segment")]
+            if segs:
+                self.report(
+                    {'INFO'},
+                    "Earlier holds kept on %s (re-attach with a new "
+                    "offset)." % ", ".join("%s->%s" % item
+                                          for item in segs))
+        if self.action == "attach":
             far = [(r["side"], r.get("grip_distance", 0.0))
                    for r in results
                    if r.get("grip_distance", 0.0) > GRIP_DISTANCE_WARN]
@@ -73,8 +82,7 @@ def _sync_mode_enum(armature, context):
     """Update the scene mode dropdown to reflect actual constraint state."""
     states = {}
     for side in SIDES:
-        con = con_util.find_attach_constraint(armature, side)
-        states[side] = bool(con is not None and con.influence >= 0.5)
+        states[side] = bool(con_util.is_hand_attached(armature, side))
     for mode, want in MODES.items():
         if want == states:
             context.scene.wpn_mode = mode
@@ -159,8 +167,7 @@ class WPN_OT_set_mode(_WPN_AttachDetachBase, bpy.types.Operator):
         want = MODES[self.mode]
         try:
             for side in SIDES:
-                con = con_util.find_attach_constraint(armature, side)
-                attached = bool(con is not None and con.influence >= 0.5)
+                attached = con_util.is_hand_attached(armature, side)
                 if want[side] and not attached:
                     con_util.attach_preserve_transform(
                         armature, side, frame=_frame(context), key=True)

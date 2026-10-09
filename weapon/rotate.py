@@ -171,9 +171,8 @@ def rotate_toward(armature, pivot, drag, target_world, key=False,
     for sname, hb in (("R", "c_hand_ik.r"), ("L", "c_hand_ik.l")):
         if sname not in hands_before:
             continue
-        con = con_util.find_attach_constraint(armature, sname)
         now = transforms.get_pose_bone_world_matrix(armature, hb, dg)
-        if con is not None and con.influence > 0.0:
+        if con_util.is_hand_attached(armature, sname):
             want = w_delta @ hands_before[sname]
             t_err, _ = transforms.matrix_difference(want, now)
             if t_err > 1e-3:

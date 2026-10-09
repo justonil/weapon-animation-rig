@@ -620,8 +620,21 @@ def _restore_hand_ik(saved):
 def _require_detached(armature, side):
     """Hands glued by Child Of must not be posed by hand-snap."""
     from ..utils import constraints as con_util
-    con = con_util.find_attach_constraint(armature, side)
-    if con is not None and con.influence > 0.0:
+    import sys as _sys
+    from ..animation import keyframes as _kf_dbg
+    _hand = HAND_BONES[side]
+    for _cn in [con_util.ATTACH_CONSTRAINT[side]] + [
+            c.name for c in con_util.find_attach_segments(armature, side)]:
+        _fc = _kf_dbg.find_fcurve(
+            armature, _kf_dbg.influence_data_path(_hand, _cn))
+        print("  [DBG req-det %s] %s keys=%s eval@cur=%s" % (
+            side, _cn,
+            [(round(_k.co[0]), round(_k.co[1], 2)) for _k in _fc.keyframe_points]
+            if _fc is not None else None,
+            round(_fc.evaluate(bpy.context.scene.frame_current), 2)
+            if _fc is not None else None), file=_sys.stderr)
+    con = con_util.attached_constraint(armature, side)
+    if con is not None:
         raise WeaponRigError(
             "Hand %s is attached (influence %.2f) -- Detach it first, "
             "then snap the hand to the weapon." % (side, con.influence))

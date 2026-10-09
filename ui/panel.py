@@ -19,8 +19,7 @@ def _arm(scene):
 
 def _attach_state(arm, side):
     try:
-        con = con_util.find_attach_constraint(arm, side)
-        return con is not None and con.influence > 0.0
+        return con_util.is_hand_attached(arm, side)
     except Exception:
         return False
 

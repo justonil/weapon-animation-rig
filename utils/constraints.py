@@ -283,6 +283,214 @@ def count_attach_constraints(armature, side):
     return sum(1 for c in pbone.constraints if c.name == ATTACH_CONSTRAINT[side])
 
 
+# ---------------------------------------------------------------------------
+# Segment constraints: one inverse per attach range (history preservation)
+# ---------------------------------------------------------------------------
+# Child Of inverse_matrix is a single static property -- it cannot be
+# keyframed (Blender 5.2: "not animatable"). So a second attach with a
+# different hand/weapon offset would silently corrupt every earlier
+# attached range on playback (verified: 0.27 jump after re-attach). Instead
+# the earlier ranges keep their inverse on a segment constraint while the
+# main constraint takes the new one; stepped influence keys partition the
+# timeline so exactly one attach constraint is active per frame.
+SEG_SUFFIX = "_seg"
+# Divergence threshold: identical re-attach recomputes bit-identical
+# inverses (~1e-7); a genuinely different catch pose differs by orders of
+# magnitude more (verified 0.6).
+DIVERGE_TOL = 1e-4
+
+
+def _seg_prefix(side):
+    return ATTACH_CONSTRAINT[side] + SEG_SUFFIX
+
+
+def find_attach_segments(armature, side):
+    """All WPN_Attach_*_segN CHILD_OF constraints on the hand, stack order."""
+    pbone = armature.pose.bones.get(HAND_BONES[side])
+    if pbone is None:
+        return []
+    prefix = _seg_prefix(side)
+    out = []
+    for c in pbone.constraints:
+        if c.name == ATTACH_CONSTRAINT[side]:
+            continue
+        if not c.name.startswith(prefix):
+            continue
+        if c.type != 'CHILD_OF':
+            raise WeaponRigError(
+                "Constraint %s on %s exists but is not a Child Of "
+                "constraint (found %s) -- refusing to use it."
+                % (c.name, HAND_BONES[side], c.type))
+        out.append(c)
+    return out
+
+
+def attached_constraint(armature, side):
+    """The attach constraint (main or segment) driving the hand RIGHT NOW.
+
+    Live-RNA based (threshold 0.5, main wins ties): this answers what the
+    viewport shows, which is what detach/snap/UI operate on. Ranges exist
+    precisely so RNA matches keyed playback at every settled state.
+    Returns None when the hand is free. Name clashes still raise loudly
+    (never silently reused).
+    """
+    main = find_attach_constraint(armature, side)
+    if main is not None and float(main.influence) > 0.5:
+        return main
+    for seg in find_attach_segments(armature, side):
+        if float(seg.influence) > 0.5:
+            return seg
+    return None
+
+
+def is_hand_attached(armature, side):
+    """True when any attach constraint drives the hand right now."""
+    try:
+        return attached_constraint(armature, side) is not None
+    except Exception:
+        return False
+
+
+def _attached_ranges(armature, side, main_name, upto_frame, pre_rna=None):
+    """[(start, end|None)] frames where MAIN reads attached (CONSTANT steps).
+
+    Only ranges with start < upto_frame. No fcurve: the static RNA value
+    applies everywhere -> [(frame_start, None)] when active, else [].
+    ``pre_rna`` overrides the live RNA read (attach captures it before
+    touching influence; the live value mid-operation is already 1.0).
+    """
+    from ..animation import keyframes
+    hand = HAND_BONES[side]
+    path = keyframes.influence_data_path(hand, main_name)
+    fc = keyframes.find_fcurve(armature, path)
+    if fc is None:
+        active = float(pre_rna) if pre_rna is not None else None
+        if active is None:
+            pbone = armature.pose.bones.get(hand)
+            con = pbone.constraints.get(main_name) if pbone else None
+            active = float(con.influence) if con is not None else 0.0
+        if active > 0.5:
+            return [(bpy.context.scene.frame_start, None)]
+        return []
+    keys = sorted(fc.keyframe_points, key=lambda k: k.co[0])
+    ranges = []
+    for i, k in enumerate(keys):
+        if float(k.co[1]) < 0.5:
+            continue
+        start = int(round(float(k.co[0])))
+        end = None
+        if i + 1 < len(keys):
+            end = int(round(float(keys[i + 1].co[0])))
+        if start < upto_frame:
+            ranges.append((start, end))
+    return ranges
+
+
+def _key_influence_stepped(armature, hand, con_name, frame, value):
+    """Set influence, insert one key, force CONSTANT (checked, loud)."""
+    from ..animation import keyframes
+    pbone = armature.pose.bones.get(hand)
+    con = pbone.constraints.get(con_name) if pbone is not None else None
+    if con is None:
+        raise WeaponRigError(
+            "Cannot key influence: constraint %s missing on %s."
+            % (con_name, hand))
+    # keyframe_insert records the CURRENT property value -- set it first
+    # (same discipline as keyframe_influence; otherwise every key would
+    # capture stale RNA, e.g. all zeros on a fresh segment constraint).
+    con.influence = float(value)
+    path = keyframes.influence_data_path(hand, con_name)
+    if not armature.keyframe_insert(path, frame=frame):
+        raise WeaponRigError(
+            "Failed to insert keyframe '%s' at frame %s." % (path, frame))
+    fc = keyframes.find_fcurve(armature, path)
+    if fc is not None:
+        for k in fc.keyframe_points:
+            k.interpolation = 'CONSTANT'
+        try:
+            fc.update()
+        except Exception:
+            pass
+
+
+def _next_seg_name(armature, side):
+    prefix = _seg_prefix(side)
+    pbone = armature.pose.bones[HAND_BONES[side]]
+    taken = {c.name for c in pbone.constraints
+             if c.name.startswith(prefix)}
+    n = 2
+    while "%s%d" % (prefix, n) in taken:
+        n += 1
+    return "%s%d" % (prefix, n)
+
+
+def _freeze_history_to_segment(armature, side, main_con, old_inverse,
+                               upto_frame, pre_rna=None):
+    """Move earlier attached ranges onto a segment holding ``old_inverse``.
+
+    Creates WPN_Attach_*_segN (target/subtarget copied from main, placed
+    before main so main stays last), keys it 1 on each earlier attached
+    range (0 elsewhere, CONSTANT, guarded), and zeroes the main
+    constraint on those ranges. Returns (seg_name, ranges) or (None, []).
+    Freezing writes the minimum keys to keep existing ranges exact -- it
+    runs even with key=False, because the alternative is corrupting
+    already-keyed motion (the current-frame keying still honors `key`).
+    """
+    from ..animation import keyframes
+    hand = HAND_BONES[side]
+    ranges = _attached_ranges(armature, side, main_con.name, upto_frame,
+                              pre_rna=pre_rna)
+    ranges = [(a, b if b is not None else upto_frame) for (a, b) in ranges]
+    # Degenerate ranges (empty: static-attached history starting exactly
+    # at the attach frame) need no freezing -- only pre-frame_start
+    # static pose is affected, which playback never reaches.
+    ranges = [(a, b) for (a, b) in ranges if a < b]
+    if not ranges:
+        return None, []
+    pbone = armature.pose.bones[hand]
+    seg_name = _next_seg_name(armature, side)
+    seg = pbone.constraints.new('CHILD_OF')
+    seg.name = seg_name
+    if seg.name != seg_name:
+        pbone.constraints.remove(seg)
+        raise WeaponRigError(
+            "Could not create segment constraint %s (renamed to %s)."
+            % (seg_name, seg.name))
+    seg.target = main_con.target
+    seg.subtarget = main_con.subtarget
+    seg.influence = 0.0
+    seg.inverse_matrix = old_inverse
+    # Segment before main: main must stay last (plan §41 stack rule).
+    idx_seg = next(i for i, c in enumerate(pbone.constraints)
+                   if c.name == seg_name)
+    idx_main = next(i for i, c in enumerate(pbone.constraints)
+                    if c.name == main_con.name)
+    if idx_seg > idx_main:
+        pbone.constraints.move(idx_seg, idx_main)
+    first_a = min(a for (a, _b) in ranges)
+    _key_influence_stepped(armature, hand, seg_name, first_a - 1, 0.0)
+    for (a, b) in ranges:
+        _key_influence_stepped(armature, hand, seg_name, a, 1.0)
+        _key_influence_stepped(armature, hand, seg_name, b, 0.0)
+    main_path = keyframes.influence_data_path(hand, main_con.name)
+    main_fc = keyframes.find_fcurve(armature, main_path)
+    if main_fc is not None:
+        starts = {a for (a, _b) in ranges}
+        for k in main_fc.keyframe_points:
+            if int(round(float(k.co[0]))) in starts:
+                k.co[1] = 0.0
+        try:
+            main_fc.update()
+        except Exception:
+            pass
+    else:
+        # Static-attached history: pin it off explicitly from frame_start
+        # (a single key; playback before frame_start is out of scope).
+        fs = bpy.context.scene.frame_start
+        _key_influence_stepped(armature, hand, main_con.name, fs, 0.0)
+    return seg_name, ranges
+
+
 def _verify_channel_keys(armature, bone_name, frame, keyed):
     """Confirm transform keys landed (off-frame keying path).
 
@@ -364,6 +572,12 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
         # normalization can never invalidate the captured transform.
         con, created = ensure_attach_constraint(armature, side)
 
+        # Pre-operation influence state for history decisions below: the
+        # Pre-operation influence for the guard value and the static
+        # history branch below: both must read this, never the live RNA
+        # (later steps set it to 1.0 for the new attach).
+        _pre_rna = float(con.influence)
+
         # 1. Store current world transform of the hand (plan §10 step 2).
         w_before = transforms.get_pose_bone_world_matrix(armature, hand, dg)
 
@@ -380,6 +594,7 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
 
         mw_inv = armature.matrix_world.inverted()
         want_arm = mw_inv @ w_before  # desired arm-space result
+        prev_inverse = con.inverse_matrix.copy()
         con.inverse_matrix = t.inverted() @ want_arm @ p.inverted()
 
         # 6. Influence 1 (plan §10 step 6).
@@ -398,15 +613,39 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
                 "Constraint rolled back to detached."
                 % (hand, *transforms.matrix_difference(w_before, w_after)))
 
-        # 8. Keyframe influence (plan §10 step 8, §12 -- stepped, guard-keyed).
+        # 7b. History preservation: inverse_matrix is static, so a
+        # divergent re-attach would corrupt every earlier attached range
+        # on playback. Freeze those ranges onto a segment constraint
+        # holding the PREVIOUS inverse first (their motion stays exact).
+        new_inverse = con.inverse_matrix.copy()
+        div = max(abs(a - b) for ra, rb in zip(prev_inverse, new_inverse)
+                  for a, b in zip(ra, rb))
+        seg_name, frozen_ranges = None, []
+        if div > DIVERGE_TOL:
+            seg_name, frozen_ranges = _freeze_history_to_segment(
+                armature, side, con, prev_inverse, frame,
+                pre_rna=_pre_rna)
         # Post-key check is frame-aware: a pose re-read is only meaningful at
         # the CURRENT frame (keyframe_insert dirties animation data, so reads
         # elsewhere would see the fcurve's current-frame value, not the key).
         # Off-frame, verify the written key values instead.
         at_current = (frame == bpy.context.scene.frame_current)
-        if key:
+        pinned_groups = []
+        if key and at_current:
+            # Pin the hold BEFORE keying influence: a Child Of composes
+            # hand channels on top of the follow, so swinging keys inside
+            # the new range would slide the hand off the grip. Static
+            # hands pin nothing (zero behavior change there).
+            from ..animation import keyframes as _kf_pin
+            pinned_groups = _kf_pin.pin_hold_channels(
+                armature, hand, frame)
+        # A freeze re-partitions the timeline: the main 1@G key is then
+        # mandatory even with key=False, otherwise RNA (1.0) and fcurves
+        # (0 at G) disagree and the hand drops on the next scrub.
+        if key or seg_name is not None:
             from ..animation import keyframes
-            keyframes.keyframe_influence(armature, hand, con.name, frame, 1.0)
+            keyframes.keyframe_influence(armature, hand, con.name, frame,
+                                          1.0, pre_value=_pre_rna)
             if at_current:
                 # 10-11. Re-verify AFTER keying (plan §10): writing keys must
                 # not have moved anything either.
@@ -436,6 +675,9 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
             "world_after": w_after,
             "grip_distance": (grip_now.translation
                                 - w_after.translation).length,
+            "segment": seg_name,
+            "frozen_ranges": frozen_ranges,
+            "pinned_groups": pinned_groups,
         }
     finally:
         # Re-enable IK solvers. After that the solver evaluates the now-
@@ -479,8 +721,11 @@ def preserve_attached_hands(armature, captured):
     mw_inv = armature.matrix_world.inverted()
     for side, want_world in captured.items():
         hand = HAND_BONES[side]
-        con = find_attach_constraint(armature, side)
-        if con is None or con.influence <= 0.0:
+        # Re-glue only the constraint actually driving the hand right now
+        # (main or history segment) -- rewriting a frozen segment's
+        # inverse would corrupt its ranges.
+        con = attached_constraint(armature, side)
+        if con is None:
             continue  # detached: constraint off, hand never moved
         # Measure P with OUR influence at 0 (transient; restored below).
         con.influence = 0.0
@@ -532,10 +777,16 @@ def detach_preserve_transform(armature, side, frame=None, key=True):
     dg = transforms.evaluated_depsgraph()
     w_before = transforms.get_pose_bone_world_matrix(armature, hand, dg)
 
-    if con.influence == 0.0:
+    # Detach whatever actually drives the hand right now: the main
+    # constraint or a history segment (a frozen range edited later).
+    active = attached_constraint(armature, side)
+    if active is None:
         return {"side": side, "created": False, "had_constraint": True,
                 "changed": False, "world_before": w_before,
                 "world_after": w_before}
+    con = active
+    # Entry influence for the guard value below (must precede any write).
+    _det_pre = float(con.influence)
 
     # Snapshot channels BEFORE compensation so we can guard-key the old
     # values at frame-1 if we end up rewriting them (plan §30).
@@ -571,7 +822,8 @@ def detach_preserve_transform(armature, side, frame=None, key=True):
     if key:
         keyed = keyframes.key_changed_channels(armature, hand, frame,
                                                old_channels)
-        keyframes.keyframe_influence(armature, hand, con.name, frame, 0.0)
+        keyframes.keyframe_influence(armature, hand, con.name, frame, 0.0,
+                                      pre_value=_det_pre)
         if at_current:
             # 8/9. Re-evaluate and verify AFTER keying (plan §11).
             dg = transforms.evaluated_depsgraph()

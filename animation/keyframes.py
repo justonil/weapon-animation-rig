@@ -186,13 +186,18 @@ def _restore_influence(armature, bone_name, constraint_name):
         value
 
 
-def keyframe_influence(armature, bone_name, constraint_name, frame, value):
+def keyframe_influence(armature, bone_name, constraint_name, frame, value,
+                       pre_value=None):
     """Key ``value`` at ``frame`` with a guard at frame-1 when needed.
 
     The guard value is read from the fcurve itself (evaluated at
-    frame-1) when one exists, else the current static property value --
-    in both cases it is exactly what frames before the transition showed
-    (plan §12: stepped adjacent transitions, no leaking into the past).
+    frame-1) when one exists, else ``pre_value`` when given, else the
+    current static property value -- in all cases it is exactly what
+    frames before the transition showed (plan §12: stepped adjacent
+    transitions, no leaking into the past). ``pre_value`` is the
+    operation's entry RNA value: callers that already rewrote the live
+    property (attach sets 1.0 before keying) must pass it, otherwise the
+    guard would capture the NEW value and leak it backwards.
 
     All keys on the fcurve are set to CONSTANT (plan §12).
     """
@@ -213,9 +218,11 @@ def keyframe_influence(armature, bone_name, constraint_name, frame, value):
             try:
                 prev_value = fc.evaluate(frame - 1)
             except Exception:
-                prev_value = con.influence
+                prev_value = (pre_value if pre_value is not None
+                              else con.influence)
         else:
-            prev_value = con.influence
+            prev_value = (pre_value if pre_value is not None
+                          else con.influence)
         con.influence = prev_value
         _checked_insert(armature, path, frame - 1)
 
@@ -329,6 +336,71 @@ def key_changed_channels(armature, bone_name, frame, old_snapshot):
         keyed[group] = guard
     _restore_channels(armature, bone_name, list(keyed))
     return keyed
+
+
+def pin_hold_channels(armature, bone_name, frame):
+    """Pin the hand's current channels flat at ``frame`` (attached hold).
+
+    A Child Of composes the owner's channels on top of the follow
+    (world = target @ inverse @ channels), so swinging hand keys inside
+    an attached range would slide the hand off the grip. This keys the
+    current channel values at ``frame`` with CONSTANT interpolation (the
+    hold stays glued until the next key) plus a guard at frame-1 holding
+    the evaluated values (pre-existing free motion into the hold is
+    untouched). Groups whose guard matches (static hands) are skipped --
+    zero behavior change there. Only the new key is forced CONSTANT;
+    every other key keeps its interpolation.
+    Returns the list of pinned channel groups.
+    """
+    pbone = armature.pose.bones[bone_name]
+    mode = pbone.rotation_mode
+    rot_group = {"QUATERNION": "rotation_quaternion",
+                 "AXIS_ANGLE": "rotation_axis_angle"}.get(
+                     mode, "rotation_euler")
+    new_values = {"location": tuple(pbone.location),
+                  "scale": tuple(pbone.scale),
+                  rot_group: tuple(getattr(pbone, rot_group))}
+    pinned = []
+    for group, new in new_values.items():
+        path = 'pose.bones["%s"].%s' % (bone_name, group)
+        size = len(new)
+        has_fc = any(_find_fcurve_index(armature, path, index) is not None
+                     for index in range(size))
+        guard = []
+        for index in range(size):
+            fc = _find_fcurve_index(armature, path, index)
+            if fc is None:
+                guard.append(float(new[index]))
+            else:
+                try:
+                    guard.append(float(fc.evaluate(frame - 1)))
+                except Exception:
+                    guard.append(float(new[index]))
+        guard = tuple(guard)
+        if has_fc and all(abs(a - b) <= 1e-6 for a, b in zip(guard, new)):
+            continue  # history governs; nothing to pin (plan §31)
+        # No history yet (first keys ever: also shields all earlier frames
+        # from single-future-key backward leaks) or diverged values.
+        _set_channel_group(pbone, group, guard)
+        _checked_insert(armature, path, frame - 1)
+        _set_channel_group(pbone, group, new)
+        _checked_insert(armature, path, frame)
+        # Force CONSTANT on the frame key of EVERY index fcurve:
+        # find_fcurve() alone returns only the first index.
+        for index in range(size):
+            fc_i = _find_fcurve_index(armature, path, index)
+            if fc_i is None:
+                continue
+            key = find_key_at(fc_i, frame)
+            if key is not None:
+                key.interpolation = 'CONSTANT'
+            try:
+                fc_i.update()
+            except Exception:
+                pass
+        pinned.append(group)
+    _restore_channels(armature, bone_name, pinned)
+    return pinned
 
 
 def _set_channel_group(pbone, group, values):

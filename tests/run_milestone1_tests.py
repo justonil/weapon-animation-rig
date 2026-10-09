@@ -417,6 +417,227 @@ def test_reattach(arm):
     con_util.detach_preserve_transform(arm, "R", frame=91, key=True)
 
 
+def _rel_offset(arm, weapon, hand_bone):
+    w = transforms.get_pose_bone_world_matrix(arm, weapon)
+    h = transforms.get_pose_bone_world_matrix(arm, hand_bone)
+    return w.inverted() @ h
+
+
+def _rel_same(a, b):
+    """(trans, rot3x3) difference; elementwise rotation (q/-q safe)."""
+    t = (a.translation - b.translation).length
+    r3a, r3b = a.to_3x3(), b.to_3x3()
+    r = max(abs(x - y) for ra, rb in zip(r3a, r3b)
+            for x, y in zip(ra, rb))
+    return t, r
+
+
+def test_reattach_divergent_preserves_history():
+    section("Divergent re-attach freezes history (throw/catch playback)")
+    from weapon_animation_rig.animation import keyframes
+    prev_active = bpy.context.view_layer.objects.active
+    prev_wpn = bpy.context.scene.wpn_armature
+    arm = build_rig()
+    bpy.context.scene.wpn_armature = arm
+    scene = bpy.context.scene
+    weapon, hand = "weapon", "c_hand_ik.r"
+    wpath = 'pose.bones["weapon"].location'
+    hpath = 'pose.bones["c_hand_ik.r"].location'
+
+    def hworld():
+        return transforms.get_pose_bone_world_matrix(arm, hand)
+
+    def inf_at(cname, f):
+        fc = keyframes.find_fcurve(
+            arm, 'pose.bones["%s"].constraints["%s"].influence'
+            % (hand, cname))
+        return fc.evaluate(f) if fc is not None else 0.0
+
+    # Weapon AND hand keyed at BOTH ends first (no extrapolation leaks:
+    # a lone future key would bleed posed values backward into the
+    # measured range, which is a test artifact, not attach behavior).
+    scene.frame_set(1)
+    transforms.update_view_layer()
+    arm.keyframe_insert(wpath, frame=1)
+    arm.keyframe_insert(hpath, frame=1)
+    con_util.attach_preserve_transform(arm, "R", frame=1, key=True)
+    rel1 = _rel_offset(arm, weapon, hand)
+    w1 = hworld().copy()
+
+    # Throw: detach @10, move weapon (keyed), free-pose hand, catch @10.
+    scene.frame_set(10)
+    transforms.update_view_layer()
+    con_util.detach_preserve_transform(arm, "R", frame=10, key=True)
+    arm.pose.bones[weapon].location = (0.6, -0.2, 0.4)
+    transforms.update_view_layer()
+    arm.keyframe_insert(wpath, frame=10)
+    # Pin hand history flat through frame 9 (rest values held so far).
+    arm.pose.bones[hand].location = (0.0, 0.0, 0.0)
+    transforms.update_view_layer()
+    arm.keyframe_insert(hpath, frame=9)
+    arm.pose.bones[hand].location = (0.25, 0.05, -0.1)
+    transforms.update_view_layer()
+    arm.keyframe_insert(hpath, frame=10)
+    inv1 = arm.pose.bones[hand].constraints[
+        "WPN_Attach_R"].inverse_matrix.copy()
+    res = con_util.attach_preserve_transform(arm, "R", frame=10, key=True)
+    check("divergent re-attach succeeds", res.get("side") == "R",
+          str(res))
+    check("history frozen to a segment", res.get("segment") is not None,
+          str(res))
+
+    # Frame 1 (fully keyed): absolute world intact.
+    scene.frame_set(1)
+    transforms.update_view_layer()
+    t, r = transforms.matrix_difference(w1, hworld())
+    check("frame-1 hand world intact",
+          t <= TOL_TRANSLATION and r <= TOL_ROTATION_DEG,
+          "d-t=%.6f d-r=%.4f" % (t, r))
+
+    # Old range: relative offset constant (rigid follow, old glue).
+    ok, detail = True, ""
+    for f in (1, 3, 5, 7, 9):
+        scene.frame_set(f)
+        transforms.update_view_layer()
+        t, r = _rel_same(rel1, _rel_offset(arm, weapon, hand))
+        if t > TOL_TRANSLATION or r > 1e-4:
+            ok = False
+            detail += "f%d d-t=%.5f d-r3=%.5f; " % (f, t, r)
+    check("old range keeps old offset (rigid follow)", ok, detail)
+
+    # New range: new offset, constant too; genuinely different (divergent).
+    scene.frame_set(10)
+    transforms.update_view_layer()
+    rel2 = _rel_offset(arm, weapon, hand)
+    ok, detail = True, ""
+    for f in (10, 12):
+        scene.frame_set(f)
+        transforms.update_view_layer()
+        t, r = _rel_same(rel2, _rel_offset(arm, weapon, hand))
+        if t > TOL_TRANSLATION or r > 1e-4:
+            ok = False
+            detail += "f%d d-t=%.5f d-r3=%.5f; " % (f, t, r)
+    check("new range keeps new offset", ok, detail)
+    t, r = _rel_same(rel1, rel2)
+    check("offsets genuinely differ (divergent case)",
+          t > 1e-3 or r > 1e-3, "d-t=%.5f d-r3=%.5f" % (t, r))
+
+    # Hold pinning: swing keys AFTER the catch must not slide the hold.
+    # Weapon frozen for 10-15 (static hold), hand gets a real swing key.
+    arm.pose.bones[weapon].location = (0.6, -0.2, 0.4)
+    transforms.update_view_layer()
+    arm.keyframe_insert(wpath, frame=15)
+    hpb = arm.pose.bones[hand]
+    hpb.location = (0.9, -0.8, 0.7)
+    if hpb.rotation_mode == 'QUATERNION':
+        hpb.rotation_quaternion = (0.7, 0.0, 0.7, 0.14)
+        _n = sum(x * x for x in hpb.rotation_quaternion) ** 0.5
+        hpb.rotation_quaternion = tuple(
+            x / _n for x in hpb.rotation_quaternion)
+        transforms.update_view_layer()
+        arm.keyframe_insert(hpath, frame=15)
+        arm.keyframe_insert(
+            'pose.bones["%s"].rotation_quaternion' % hand, frame=15)
+    else:
+        hpb.rotation_euler = Euler((0.9, -0.7, 0.5))
+        transforms.update_view_layer()
+        arm.keyframe_insert(hpath, frame=15)
+        arm.keyframe_insert(
+            'pose.bones["%s"].rotation_euler' % hand, frame=15)
+    scene.frame_set(10)
+    transforms.update_view_layer()
+    w10 = hworld().copy()
+    scene.frame_set(12)
+    transforms.update_view_layer()
+    t, r = transforms.matrix_difference(w10, hworld())
+    check("hold stays glued through blend zone",
+          t <= TOL_TRANSLATION and r <= TOL_ROTATION_DEG,
+          "d-t=%.6f d-r=%.4f" % (t, r))
+
+    # Segment content + influence partition.
+    segs = con_util.find_attach_segments(arm, "R")
+    check("exactly one history segment", len(segs) == 1,
+          "found %d" % len(segs))
+    if segs:
+        d = max(abs(a - b) for ra, rb in zip(inv1, segs[0].inverse_matrix)
+                for a, b in zip(ra, rb))
+        check("segment keeps the first inverse", d <= 1e-6,
+              "div=%.7f" % d)
+        check("seg drives early frames, main released",
+              inf_at(segs[0].name, 3) == 1.0
+              and inf_at("WPN_Attach_R", 3) == 0.0)
+        check("main drives frame 10+, seg released",
+              inf_at("WPN_Attach_R", 10) == 1.0
+              and inf_at(segs[0].name, 10) == 0.0)
+    main_inv = arm.pose.bones[hand].constraints[
+        "WPN_Attach_R"].inverse_matrix
+    d = max(abs(a - b) for ra, rb in zip(inv1, main_inv)
+            for a, b in zip(ra, rb))
+    check("main took the new inverse", d > 1e-4, "div=%.7f" % d)
+
+    # Detach inside the frozen range works on the segment.
+    scene.frame_set(5)
+    transforms.update_view_layer()
+    w5 = hworld().copy()
+    con_util.detach_preserve_transform(arm, "R", frame=5, key=True)
+    check("detach inside seg range frees the hand",
+          inf_at(segs[0].name, 5) == 0.0 if segs else False)
+    t, r = transforms.matrix_difference(w5, hworld())
+    check("detach inside seg range has no pop",
+          t <= TOL_TRANSLATION and r <= TOL_ROTATION_DEG,
+          "d-t=%.6f d-r=%.4f" % (t, r))
+    scene.frame_set(1)
+    transforms.update_view_layer()
+    t, r = transforms.matrix_difference(w1, hworld())
+    check("frame 1 still glued after range detach",
+          t <= TOL_TRANSLATION and r <= TOL_ROTATION_DEG,
+          "d-t=%.6f d-r=%.4f" % (t, r))
+
+    # Validation accepts segments.
+    okv, report = rig_validate.validate_weapon_rig(arm)
+    text = "\n".join(report)
+    check("validation accepts segments", okv, text)
+    check("segment line in report", "seg" in text)
+
+    bpy.context.scene.wpn_armature = prev_wpn
+    bpy.context.view_layer.objects.active = prev_active
+
+
+def test_reattach_same_pose_no_segment():
+    section("Same-pose re-attach creates no segment")
+    prev_active = bpy.context.view_layer.objects.active
+    prev_wpn = bpy.context.scene.wpn_armature
+    arm = build_rig()
+    bpy.context.scene.wpn_armature = arm
+    scene = bpy.context.scene
+    scene.frame_set(1)
+    transforms.update_view_layer()
+
+    def hworld():
+        return transforms.get_pose_bone_world_matrix(arm, "c_hand_ik.r")
+
+    con_util.attach_preserve_transform(arm, "R", frame=1, key=True)
+    w1 = hworld().copy()
+    con_util.detach_preserve_transform(arm, "R", frame=5, key=True)
+    res = con_util.attach_preserve_transform(arm, "R", frame=5, key=True)
+    check("same-pose re-attach succeeds", res.get("side") == "R",
+          str(res))
+    check("no segment created",
+          len(con_util.find_attach_segments(arm, "R")) == 0)
+    check("still exactly one main constraint",
+          con_util.count_attach_constraints(arm, "R") == 1)
+    check("no segment reported", res.get("segment") is None, str(res))
+    scene.frame_set(1)
+    transforms.update_view_layer()
+    t, r = transforms.matrix_difference(w1, hworld())
+    check("frame-1 pose intact",
+          t <= TOL_TRANSLATION and r <= TOL_ROTATION_DEG,
+          "d-t=%.6f d-r=%.4f" % (t, r))
+
+    bpy.context.scene.wpn_armature = prev_wpn
+    bpy.context.view_layer.objects.active = prev_active
+
+
 def test_influence_keys(arm):
     section("Attachment keyframes stepped (plan §12, §31)")
     from weapon_animation_rig.animation import keyframes
@@ -442,6 +663,26 @@ def test_influence_keys(arm):
     # Timeline produced by the preceding tests:
     #   R: attach @1, re-attach @2, detach @91
     #   L: attach @1, detach @1, attach @3, detach @51, attach @90, det @91
+    # L's attach @90 is DIVERGENT (weapon moved since): the [3,51] range
+    # now lives on a history segment, main reads 0 there -- effective
+    # (any-constraint) influence is what playback sees.
+    def eff_influence(side, frame):
+        hand = "c_hand_ik.%s" % side.lower()
+        names = ["WPN_Attach_%s" % side]
+        try:
+            names.extend(c.name for c in
+                         con_util.find_attach_segments(arm, side))
+        except WeaponRigError:
+            pass
+        vals = []
+        for cname in names:
+            fc = keyframes.find_fcurve(
+                arm, 'pose.bones["%s"].constraints["%s"].influence'
+                % (hand, cname))
+            if fc is not None:
+                vals.append(fc.evaluate(frame))
+        return max(vals) if vals else 0.0
+
     check("R influence is 1 at frame 10 (attached)", fc_r.evaluate(10) == 1.0,
           "got %s" % fc_r.evaluate(10))
     check("R influence is 1 at frame 51 (still attached)",
@@ -449,13 +690,38 @@ def test_influence_keys(arm):
     check("R influence is 0 at frame 92 (detached)",
           fc_r.evaluate(92) == 0.0, "got %s" % fc_r.evaluate(92))
     check("L influence is 0 at frame 51 (detached)",
-          fc_l.evaluate(51) == 0.0, "got %s" % fc_l.evaluate(51))
-    check("L influence is 1 at frame 10 (attached)",
-          fc_l.evaluate(10) == 1.0, "got %s" % fc_l.evaluate(10))
+          eff_influence("L", 51) == 0.0,
+          "got %s" % eff_influence("L", 51))
+    check("L influence is 1 at frame 10 (attached, via segment)",
+          eff_influence("L", 10) == 1.0,
+          "got %s" % eff_influence("L", 10))
     check("L influence is 1 at frame 90 (reattached)",
-          fc_l.evaluate(90) == 1.0, "got %s" % fc_l.evaluate(90))
+          eff_influence("L", 90) == 1.0,
+          "got %s" % eff_influence("L", 90))
     check("L influence is 0 at frame 92 (detached)",
-          fc_l.evaluate(92) == 0.0, "got %s" % fc_l.evaluate(92))
+          eff_influence("L", 92) == 0.0,
+          "got %s" % eff_influence("L", 92))
+    # Partition integrity: frame 10 lives on the segment, not main.
+    check("L frame-10 attachedness lives on a segment, main reads 0",
+          fc_l.evaluate(10) == 0.0, "main reads %s" % fc_l.evaluate(10))
+    segs_l = con_util.find_attach_segments(arm, "L")
+    check("exactly one L history segment", len(segs_l) == 1,
+          "found %d" % len(segs_l))
+    if segs_l:
+        seg_fc = keyframes.find_fcurve(
+            arm, 'pose.bones["c_hand_ik.l"].constraints["%s"].influence'
+            % segs_l[0].name)
+        check("segment influence fcurve exists", seg_fc is not None)
+        if seg_fc is not None:
+            interp = {k.interpolation for k in seg_fc.keyframe_points}
+            check("segment keys CONSTANT", interp == {'CONSTANT'},
+                  "interps=%s" % interp)
+            check("segment drives frame 10",
+                  seg_fc.evaluate(10) == 1.0,
+                  "got %s" % seg_fc.evaluate(10))
+            check("segment releases frame 90",
+                  seg_fc.evaluate(90) == 0.0,
+                  "got %s" % seg_fc.evaluate(90))
 
 
 def test_existing_animation_intact(arm):
@@ -1070,6 +1336,8 @@ def main():
     test_attach_ik_target_conflict_error()
     test_follow_and_detach(arm)
     test_reattach(arm)
+    test_reattach_divergent_preserves_history()
+    test_reattach_same_pose_no_segment()
     test_influence_keys(arm)
     test_existing_animation_intact(arm)
     test_mode_operator(arm)

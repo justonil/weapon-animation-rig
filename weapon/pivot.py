@@ -189,9 +189,7 @@ def set_pivot(armature, pivot, custom=(0.0, 0.0, 0.0), key=False,
     mw_inv = armature.matrix_world.inverted()
     attached = {s: hands_before[s] for s in ("R", "L")
                 if s in hands_before
-                and con_util.find_attach_constraint(armature, s) is not None
-                and con_util.find_attach_constraint(
-                    armature, s).influence > 0.0}
+                and con_util.is_hand_attached(armature, s)}
     target_arm = root_after_arm
     for _attempt in range(4):
         transforms.set_pose_bone_arm_matrix(armature, weapon, target_arm)
