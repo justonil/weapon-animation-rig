@@ -62,6 +62,15 @@ class _WPN_AttachDetachBase:
                     "offset)." % ", ".join("%s->%s" % item
                                           for item in segs))
         if self.action == "attach":
+            kept = [r["side"] for r in results
+                    if r.get("native_kept_warn")]
+            if kept:
+                self.report(
+                    {'WARNING'},
+                    "Kept the stored offset on %s: a native follow next "
+                    "to the weapon follow makes a re-aim unverifiable "
+                    "here. Playback and history untouched." % ", ".join(kept))
+        if self.action == "attach":
             far = [(r["side"], r.get("grip_distance", 0.0))
                    for r in results
                    if r.get("grip_distance", 0.0) > GRIP_DISTANCE_WARN]

@@ -46,6 +46,50 @@ def find_key_at(fcurve, frame, tol=1e-6):
     return None
 
 
+def _iter_channelbags(action, slot):
+    """Yield channelbags for lookup: slot-bound first, fallback after.
+
+    keyframe_insert always writes through the bound slot, and so does the
+    evaluator. Reading any other bag (e.g. bags[0] of a multi-bag strip)
+    yields stale values while the live data sits elsewhere -- verified
+    post-key misreads in tests. So the bound slot wins whenever it
+    resolves; the single-bag fallback only covers freshly assigned
+    actions (action_slot None, one bag).
+    """
+    strips = []
+    try:
+        for layer in action.layers:
+            for strip in layer.strips:
+                if strip.type == 'KEYFRAME':
+                    strips.append(strip)
+    except Exception:
+        return
+    if slot is not None:
+        for strip in strips:
+            try:
+                cb = strip.channelbag(slot)
+            except Exception:
+                cb = None
+            if cb is not None:
+                yield cb
+        return
+    for strip in strips:
+        cb = None
+        try:
+            cb = strip.channelbag(None)
+        except Exception:
+            cb = None
+        if cb is None:
+            try:
+                bags = list(strip.channelbags)
+            except Exception:
+                bags = []
+            if len(bags) == 1:
+                cb = bags[0]
+        if cb is not None:
+            yield cb
+
+
 def find_fcurve(armature, data_path):
     """Find the fcurve driving ``data_path`` on this armature, or None."""
     ad = armature.animation_data
@@ -61,31 +105,11 @@ def find_fcurve(armature, data_path):
             return fc
 
     # Slotted actions (Blender 4.4+, the only API in 5.2).
-    # NOTE: a freshly assigned action has action_slot=None; Blender binds
-    # the slot on first keyframe, and channelbag(None) resolves when there
-    # is a single channelbag. Cover both cases.
     slot = getattr(ad, "action_slot", None)
-    for layer in action.layers:
-        for strip in layer.strips:
-            if strip.type != 'KEYFRAME':
-                continue
-            cb = None
-            try:
-                cb = strip.channelbag(slot)
-            except Exception:
-                cb = None
-            if cb is None:
-                try:
-                    bags = list(strip.channelbags)
-                except Exception:
-                    bags = []
-                if len(bags) == 1:
-                    cb = bags[0]
-            if cb is None:
-                continue
-            fc = cb.fcurves.find(data_path)
-            if fc is not None:
-                return fc
+    for cb in _iter_channelbags(action, slot):
+        fc = cb.fcurves.find(data_path)
+        if fc is not None:
+            return fc
     return None
 
 
@@ -138,30 +162,13 @@ def _find_fcurve_index(armature, data_path, index):
         except Exception:
             return None
     slot = getattr(ad, "action_slot", None)
-    for layer in action.layers:
-        for strip in layer.strips:
-            if strip.type != 'KEYFRAME':
-                continue
-            cb = None
-            try:
-                cb = strip.channelbag(slot)
-            except Exception:
-                cb = None
-            if cb is None:
-                try:
-                    bags = list(strip.channelbags)
-                except Exception:
-                    bags = []
-                if len(bags) == 1:
-                    cb = bags[0]
-            if cb is None:
-                continue
-            try:
-                fc = cb.fcurves.find(data_path, index=index)
-            except Exception:
-                continue
-            if fc is not None:
-                return fc
+    for cb in _iter_channelbags(action, slot):
+        try:
+            fc = cb.fcurves.find(data_path, index=index)
+        except Exception:
+            continue
+        if fc is not None:
+            return fc
     return None
 
 
@@ -236,7 +243,8 @@ def keyframe_influence(armature, bone_name, constraint_name, frame, value,
         for k in fc.keyframe_points:
             k.interpolation = 'CONSTANT'
         fc.update()
-    _restore_influence(armature, bone_name, constraint_name)
+    # NOTE: no _restore_influence (RNA already holds the just-keyed value;
+    # re-reading risks stale-bag clobber, see pin_hold_channels).
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +342,8 @@ def key_changed_channels(armature, bone_name, frame, old_snapshot):
             guard = True
         _checked_insert(armature, path, frame)
         keyed[group] = guard
-    _restore_channels(armature, bone_name, list(keyed))
+    # NOTE: no _restore_channels (see pin_hold_channels): RNA already
+    # holds the just-keyed values; re-reading risks stale-bag clobber.
     return keyed
 
 
@@ -399,7 +408,9 @@ def pin_hold_channels(armature, bone_name, frame):
             except Exception:
                 pass
         pinned.append(group)
-    _restore_channels(armature, bone_name, pinned)
+    # NOTE: deliberately no _restore_channels here: RNA already holds the
+    # just-keyed values, and re-reading fcurves at this point has returned
+    # stale-bag values in multi-key histories (verified post-key misread).
     return pinned
 
 
@@ -414,6 +425,20 @@ def _set_channel_group(pbone, group, values):
         pbone.rotation_axis_angle = values
     elif group == "rotation_euler":
         pbone.rotation_euler = values
+
+
+def apply_channels(armature, bone_name, snap):
+    """Write a capture_channels() snapshot back to RNA (all groups).
+
+    Plain channel writes tag transforms only (never animation), so this
+    can never trigger an fcurve resync itself -- it is the repair
+    primitive for update-induced resync (see constraints._assert_hand).
+    """
+    pbone = armature.pose.bones[bone_name]
+    for group, values in snap.items():
+        if group.startswith("_"):
+            continue
+        _set_channel_group(pbone, group, values)
 
 
 # ---------------------------------------------------------------------------

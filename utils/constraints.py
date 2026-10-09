@@ -351,72 +351,6 @@ def is_hand_attached(armature, side):
         return False
 
 
-def _stash_prop_names(side):
-    base = "wpn_detach_%s_" % side
-    return base + "w", base + "h", base + "x", base + "c", base + "m"
-
-
-def _stash_detach_state(armature, side, w_world, h_world, inverse):
-    """Remember detach-time worlds + inverse + channels on the hand bone.
-
-    Lets a later attach with unmoved poses AND unchanged channels restore
-    the exact stored inverse instead of recomputing (a recompute bakes
-    RNA/fcurve epsilon into playback even when nothing moved). Overwritten
-    on every detach; stale entries can never match (attach compares worlds
-    and channels first). Never raises.
-    """
-    try:
-        from ..animation import keyframes as _kf_st
-        pbone = armature.pose.bones[HAND_BONES[side]]
-        snap = _kf_st.capture_channels(armature, HAND_BONES[side])
-        mode = snap.get("_mode", "")
-        rot_group = {"QUATERNION": "rotation_quaternion",
-                     "AXIS_ANGLE": "rotation_axis_angle"}.get(
-                         mode, "rotation_euler")
-        flat = (list(snap.get("location", ()))
-                + list(snap.get(rot_group, ()) or ())
-                + list(snap.get("scale", ())))
-        wn, hn, xn, cn, mn = _stash_prop_names(side)
-        pbone[wn] = [float(v) for row in w_world for v in row]
-        pbone[hn] = [float(v) for row in h_world for v in row]
-        pbone[xn] = [float(v) for row in inverse for v in row]
-        pbone[cn] = [float(v) for v in flat]
-        pbone[mn] = str(mode)
-    except Exception:
-        pass
-
-
-def _read_detach_stash(armature, side):
-    """(weapon_world, hand_world, inverse, channels, mode) or None.
-
-    ``channels`` is the flat channel tuple as stored, ``mode`` the
-    rotation mode string. Missing/corrupt entries (or a channels-length
-    mismatch) return None so attach falls through to recompute.
-    """
-    from mathutils import Matrix
-
-    def _mat(vals):
-        return Matrix((vals[0:4], vals[4:8], vals[8:12], vals[12:16]))
-
-    try:
-        pbone = armature.pose.bones[HAND_BONES[side]]
-        wn, hn, xn, cn, mn = _stash_prop_names(side)
-        mats = []
-        for prop in (wn, hn, xn):
-            vals = [float(v) for v in pbone[prop]]
-            if len(vals) != 16:
-                return None
-            mats.append(_mat(vals))
-        ch = tuple(float(v) for v in pbone[cn])
-        mode = str(pbone[mn])
-        rot_size = {"QUATERNION": 4, "AXIS_ANGLE": 4}.get(mode, 3)
-        if len(ch) != 3 + rot_size + 3:
-            return None
-        return mats[0], mats[1], mats[2], ch, mode
-    except Exception:
-        return None
-
-
 def _attached_ranges(armature, side, main_name, upto_frame, pre_rna=None):
     """[(start, end|None)] frames where MAIN reads attached (CONSTANT steps).
 
@@ -579,6 +513,24 @@ def _verify_channel_keys(armature, bone_name, frame, keyed):
                 "frame %s." % (path, frame - 1))
 
 
+def _native_coconstraint(armature, hand, our_name):
+    """Name of an active native co-constraint on the hand, or None.
+
+    A second (non-WPN, non-segment) CHILD_OF beside ours means step-7
+    compares across constraint states (native-detached vs WPN-attached)
+    and can never verify strict even for an exact solve.
+    """
+    pbone = armature.pose.bones.get(hand)
+    if pbone is None:
+        return None
+    for c in pbone.constraints:
+        if c.name == our_name or c.name.startswith(our_name + SEG_SUFFIX):
+            continue
+        if c.type == 'CHILD_OF' and float(c.influence or 0.0) > 0.5:
+            return c.name
+    return None
+
+
 def _verify_influence_key(armature, bone_name, con_name, frame, value):
     """Confirm an influence key landed with the intended value.
 
@@ -598,6 +550,118 @@ def _verify_influence_key(armature, bone_name, con_name, frame, value):
         raise WeaponRigError(
             "Keyframe verification failed: %s influence at frame %s is "
             "%s, expected %s." % (con_name, frame, key.co[1], value))
+
+
+def _snapshot_hand(armature, hand, con):
+    """Entry-visible hand state: (channels dict, influence float).
+
+    Attach/detach act on the VISIBLE pose (unkeyed static RNA). Captured
+    before any write/update so a later assert can restore it.
+    """
+    from ..animation import keyframes
+    return keyframes.capture_channels(armature, hand), float(con.influence)
+
+
+def _assert_hand(armature, hand, con, snap):
+    """Restore snapshot RNA after an update (repair update resync).
+
+    view_layer.update() re-applies fcurve values onto original RNA
+    channels whenever the animation subsystem was tagged dirty (fcurve
+    mute, keyframe_insert, influence writes), discarding unkeyed static
+    poses mid-operation -- bisected: RNA (0,0,0) -> fcurve (0.945,...)
+    across a single update, every later solve/verify then mixes bases
+    (attach raised d-trans 4.33 on exactly this). Re-asserting the
+    entry-visible values keeps capture/solve/verify on one basis. Plain
+    channel writes tag transforms only (never animation), so the assert
+    itself can never trigger a resync.
+    """
+    from ..animation import keyframes
+    channels, influence = snap
+    keyframes.apply_channels(armature, hand, channels)
+    con.influence = influence
+
+
+def _assert_weapon(armature, weapon, wsnap):
+    """Restore snapshot weapon channels (same resync hazard as hand).
+
+    The Child-Of solve is hand-independent (hand channels cancel out of
+    t.inverted() @ want @ p.inverted()), so the weapon pose T is the
+    only divergence carrier -- weapon statics evaporating silently
+    collapses every re-attach to a no-op keep (bisected div=0 with a
+    moved hand). Asserted alongside the hand everywhere it matters.
+    """
+    from ..animation import keyframes
+    keyframes.apply_channels(armature, weapon, wsnap)
+
+
+def _verify_channel_key_values(armature, bone_name, frame, snap, groups):
+    """Confirm channel keys @frame hold the snapshot values (exact).
+
+    fcurve-data reads (no depsgraph): immune to the stale evaluated
+    reads that follow fresh inserts. Raises on missing key or mismatch.
+    """
+    from ..animation import keyframes
+    for group in groups:
+        values = snap.get(group)
+        if not values:
+            continue
+        path = 'pose.bones["%s"].%s' % (bone_name, group)
+        for index, want in enumerate(values):
+            fc = keyframes._find_fcurve_index(armature, path, index)
+            key = keyframes.find_key_at(fc, frame)
+            if key is None:
+                raise WeaponRigError(
+                    "Keyframe verification failed: no %s[%d] key at "
+                    "frame %s." % (path, index, frame))
+            if abs(key.co[1] - want) > 1e-6:
+                raise WeaponRigError(
+                    "Keyframe verification failed: %s[%d] at frame %s "
+                    "is %s, expected %s." %
+                    (path, index, frame, key.co[1], want))
+
+
+def _verify_attach_postkey_exact(armature, hand, con, frame, snap,
+                                 pinned_groups, seg_name, frozen_ranges):
+    """Post-key verification without evaluated reads (exact values).
+
+    Fresh inserts leave the depsgraph evaluation cache stale (verified
+    0.346 misread on a hand snap+attach flow), so a pose re-read here
+    can report pre-insert values. RNA + fcurve key values are exact:
+    if keys provably record the asserted state, keying moved nothing.
+    """
+    if float(con.influence) != 1.0:
+        raise WeaponRigError(
+            "Attach %s moved after keyframing: RNA influence is %s, "
+            "expected 1.0." % (hand, con.influence))
+    _verify_influence_key(armature, hand, con.name, frame, 1.0)
+    channels, _inf = snap
+    _verify_channel_key_values(armature, hand, frame, channels,
+                               pinned_groups)
+    # NOTE: no per-key seg checks here: adjacent frozen ranges share
+    # endpoints (later 1.0 overwrites earlier 0.0), so endpoint values
+    # are partition-correct but not per-range-literal. Seg motion itself
+    # is covered by the frozen-playback tests.
+
+
+def _verify_detach_postkey_exact(armature, hand, con, frame, snap, keyed):
+    """Detach post-key verification without evaluated reads."""
+    channels, _inf = snap
+    pbone = armature.pose.bones[hand]
+    for group, values in channels.items():
+        if group.startswith("_"):
+            continue
+        live = tuple(getattr(pbone, group))
+        if any(abs(a - b) > 1e-6 for a, b in zip(live, values)):
+            raise WeaponRigError(
+                "Detach %s moved after keyframing: RNA %s is %s, "
+                "expected %s." % (hand, group, live, values))
+    if float(con.influence) != 0.0:
+        raise WeaponRigError(
+            "Detach %s moved after keyframing: RNA influence is %s, "
+            "expected 0.0." % (hand, con.influence))
+    _verify_influence_key(armature, hand, con.name, frame, 0.0)
+    _verify_channel_key_values(armature, hand, frame, channels,
+                               list(keyed))
 
 
 # ---------------------------------------------------------------------------
@@ -638,27 +702,73 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
         # normalization can never invalidate the captured transform.
         con, created = ensure_attach_constraint(armature, side)
 
-        # Pre-operation influence state for history decisions below: the
+        # Entry-visible hand state (snapshot BEFORE any write/update:
+        # later updates can re-sync RNA from fcurves, discarding unkeyed
+        # static poses -- the snapshot lets us re-assert it (see below).
+        # Weapon too: the solve's T must use the intended weapon pose
+        # (weapon statics evaporate identically; the solve is
+        # hand-independent, so T is the only divergence carrier).
+        _snap = _snapshot_hand(armature, hand, con)
+        from ..animation import keyframes as _kf_wsnap
+        _wsnap = _kf_wsnap.capture_channels(armature, weapon)
+        _kept_native_warn = False
+
         # Pre-operation influence for the guard value and the static
         # history branch below: both must read this, never the live RNA
         # (later steps set it to 1.0 for the new attach).
         _pre_rna = float(con.influence)
+        at_current = (frame == bpy.context.scene.frame_current)
+        # 0. Pin hand channels FIRST (before any read/measure/solve).
+        # Establishes RNA==fcurve coherence (guard history + flat current
+        # values): without this, an update can re-sync RNA from stale
+        # fcurves mid-operation and every later read/solve operates on a
+        # different basis than intended (verified post-key misread when
+        # static poses overlay old keys). Needs live RNA (frame==current).
+        pinned_groups = []
+        if at_current:
+            from ..animation import keyframes as _kf_pin0
+            pinned_groups = _kf_pin0.pin_hold_channels(
+                armature, hand, frame)
 
         # 1. Store current world transform of the hand (plan §10 step 2).
         w_before = transforms.get_pose_bone_world_matrix(armature, hand, dg)
-        t_before = transforms.get_pose_bone_world_matrix(armature, weapon,
-                                                          dg)
 
         # 4. Compute inverse (plan §10 step 5). First measure P: evaluated
         #    arm-space matrix with OUR influence at 0 (ARP's stack included).
         #    T is the weapon bone itself (rework: single export/control bone;
         #    the follow delta is identical to the old per-grip targets because
         #    rigid-child deltas always equal the parent bone's delta).
+        #    Mute our own influence fcurve for the transient measurement:
+        #    otherwise the update below re-syncs RNA from the fcurve (which
+        #    may read attached here from earlier keys) and P gets measured
+        #    with the constraint active (verified 0.08/28-deg solve garbage
+        #    on a real file). Restored immediately afterwards.
+        from ..animation import keyframes as _kf_mute
+        _mute_fc = _kf_mute.find_fcurve(
+            armature, _kf_mute.influence_data_path(hand, con.name))
+        _was_muted = False
+        if _mute_fc is not None:
+            try:
+                _was_muted = bool(_mute_fc.mute)
+                _mute_fc.mute = True
+            except Exception:
+                _was_muted = False
         con.influence = 0.0
         transforms.update_view_layer()
+        # Repair update resync (mute/influence writes tag animation dirty,
+        # so this update re-applies fcurve values onto RNA, discarding
+        # unkeyed statics): restore entry-visible pose before measuring
+        # P/T, or the solve mixes bases (entry world + fcurve channels).
+        _assert_hand(armature, hand, con, _snap)
+        _assert_weapon(armature, weapon, _wsnap)
         dg = transforms.evaluated_depsgraph()
         p = transforms.get_pose_bone_arm_matrix(armature, hand, dg)
         t = transforms.get_pose_bone_arm_matrix(armature, weapon, dg)
+        if _mute_fc is not None:
+            try:
+                _mute_fc.mute = _was_muted
+            except Exception:
+                pass
 
         mw_inv = armature.matrix_world.inverted()
         want_arm = mw_inv @ w_before  # desired arm-space result
@@ -674,42 +784,6 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
         div_pre = max(abs(a - b)
                       for ra, rb in zip(prev_inverse, new_inverse)
                       for a, b in zip(ra, rb))
-        # 4b. Round-trip restore: detached earlier with identical weapon +
-        # hand worlds (nothing moved since) -> put back the exact stashed
-        # inverse instead of recomputing. A recompute from merely
-        # equivalent inputs bakes float/RNA epsilon into every attached
-        # frame on playback (verified 0.12 drift on a real file with zero
-        # pose changes). Falls through to the recompute above on any
-        # mismatch (then the normal div/freeze machinery applies).
-        restored = False
-        st = _read_detach_stash(armature, side)
-        if st is not None:
-            st_w, st_h, st_x, st_ch, st_mode = st
-            # Channels must match too: same worlds through different
-            # channels would need a different inverse (then recompute).
-            pb_now = armature.pose.bones[hand]
-            now_mode = pb_now.rotation_mode
-            now_ch = tuple(float(v) for v in pb_now.location)
-            if now_mode == 'QUATERNION':
-                now_ch += tuple(float(v)
-                                for v in pb_now.rotation_quaternion)
-            elif now_mode == 'AXIS_ANGLE':
-                now_ch += tuple(float(v)
-                                for v in pb_now.rotation_axis_angle)
-            else:
-                now_ch += tuple(float(v) for v in pb_now.rotation_euler)
-            now_ch += tuple(float(v) for v in pb_now.scale)
-            chans_match = (
-                now_mode == st_mode and len(now_ch) == len(st_ch)
-                and all(abs(a - b) <= 1e-6 for a, b in zip(now_ch, st_ch)))
-            if (transforms.is_same_transform(t_before, st_w)
-                    and transforms.is_same_transform(w_before, st_h)
-                    and chans_match):
-                new_inverse = st_x.copy()
-                div_pre = max(abs(a - b)
-                              for ra, rb in zip(prev_inverse, new_inverse)
-                              for a, b in zip(ra, rb))
-                restored = True
         inverse_kept = div_pre <= 1e-6
         if not inverse_kept:
             con.inverse_matrix = new_inverse
@@ -717,26 +791,52 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
         # 6. Influence 1 (plan §10 step 6).
         con.influence = 1.0
         transforms.update_view_layer()
+        # Influence intentionally flipped: snapshot follows it (channels
+        # are still entry-visible); assert repairs a channel resync.
+        _snap = (_snap[0], 1.0)
+        _assert_hand(armature, hand, con, _snap)
+        _assert_weapon(armature, weapon, _wsnap)
 
-        # 7/10. Verify no pop (plan §10 steps 10-11, §30).
-        # Round-trip restores keep a historically tuned lean (e.g. hands
-        # riding slightly off the grips by design), so they verify against
-        # LOOSE garbage-catching bounds instead of the strict ones; a fresh
-        # recompute must always verify strict (it just solved exactly).
+        # 7/10. Verify no pop (plan §10 steps 10-11, §30). The solve
+        # above is exact by construction (or bit-identical via div-skip),
+        # so this must always verify strict; anything else is a loud bug
+        # -- EXCEPT on double-constrained hands (a native ARP Child Of
+        # beside ours): w_before is native-driven (influence 0) while
+        # w_after is WPN-driven (influence 1), and those constraint paths
+        # differ by the native-vs-WPN basis gap even for an exact solve
+        # (bisected 0.08/28.6° with bit-identical channels in and out).
+        # There the recompute is unverifiable: keep the stored inverse
+        # (history/playback untouched) and warn instead of raising, so a
+        # stale-X file stays workable and the lean is preserved.
         dg = transforms.evaluated_depsgraph()
         w_after = transforms.get_pose_bone_world_matrix(armature, hand, dg)
-        if restored:
-            _ok = transforms.is_same_transform(w_before, w_after, 1.0, 45.0)
-        else:
-            _ok = transforms.is_same_transform(w_before, w_after)
-        if not _ok:
-            # Roll back to a clean detached state before reporting.
-            con.influence = 0.0
-            transforms.update_view_layer()
-            raise WeaponRigError(
-                "Attach %s failed: hand moved (d-trans %.6f, d-rot %.4f deg). "
-                "Constraint rolled back to detached."
-                % (hand, *transforms.matrix_difference(w_before, w_after)))
+        _native_gap = _native_coconstraint(armature, hand, con.name)
+        if not transforms.is_same_transform(w_before, w_after):
+            if _native_gap is not None and not inverse_kept:
+                # Unverifiable recompute on a native-co-constrained hand:
+                # roll back ONLY the inverse write (keep history exact),
+                # leave influence glued, warn loudly (returned flag).
+                con.inverse_matrix = prev_inverse
+                transforms.update_view_layer()
+                import warnings as _warnings
+                _warnings.warn(
+                    "Attach %s keeps the stored offset (native '%s' "
+                    "beside the weapon follow makes the re-aimed solve "
+                    "unverifiable here: d-trans %.6f, d-rot %.4f deg). "
+                    "Playback/history untouched." %
+                    (hand, _native_gap,
+                     *transforms.matrix_difference(w_before, w_after)))
+                _kept_native_warn = True
+                inverse_kept = True
+            else:
+                # Roll back to a clean detached state before reporting.
+                con.influence = 0.0
+                transforms.update_view_layer()
+                raise WeaponRigError(
+                    "Attach %s failed: hand moved (d-trans %.6f, "
+                    "d-rot %.4f deg). Constraint rolled back to detached."
+                    % (hand, *transforms.matrix_difference(w_before,
+                                                           w_after)))
 
         # 7b. History preservation: inverse_matrix is static, so a
         # divergent re-attach would corrupt every earlier attached range
@@ -745,7 +845,7 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
         # (div_pre computed at step 5 against the stored inverse.)
         div = div_pre
         seg_name, frozen_ranges = None, []
-        if div > DIVERGE_TOL:
+        if div > DIVERGE_TOL and not inverse_kept:
             seg_name, frozen_ranges = _freeze_history_to_segment(
                 armature, side, con, prev_inverse, frame,
                 pre_rna=_pre_rna)
@@ -753,45 +853,28 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
         # the CURRENT frame (keyframe_insert dirties animation data, so reads
         # elsewhere would see the fcurve's current-frame value, not the key).
         # Off-frame, verify the written key values instead.
-        at_current = (frame == bpy.context.scene.frame_current)
-        pinned_groups = []
-        if at_current and not restored:
-            # Pin the hold BEFORE keying influence. Mandatory whenever we
-            # recompute (not governed by `key`): a Child Of composes hand
-            # channels on top of the follow, so swinging keys inside the
-            # new range would slide the hand off the grip. Motion-neutral
-            # by construction. Never on round-trip restore: there history
-            # motion itself is the contract (pinning would rewrite it under
-            # a CONSTANT key).
-            from ..animation import keyframes as _kf_pin
-            pinned_groups = _kf_pin.pin_hold_channels(
-                armature, hand, frame)
-        # A freeze re-partitions the timeline: the main 1@G key is then
-        # mandatory even with key=False, otherwise RNA (1.0) and fcurves
-        # (0 at G) disagree and the hand drops on the next scrub.
-        if key or seg_name is not None:
+        # (The main 1@G key below is mandatory on freeze even with
+        # key=False, otherwise RNA (1.0) and fcurves (0 at G) disagree and
+        # the hand drops on the next scrub.)
+        if key or seg_name is not None or _kept_native_warn:
+            # NOTE: keep-warn forces the 1@F key even with key=False
+            # (like freeze): RNA is attached while fcurves may read
+            # detached there, and the hand would drop on scrub.
             from ..animation import keyframes
             keyframes.keyframe_influence(armature, hand, con.name, frame,
                                           1.0, pre_value=_pre_rna)
             if at_current:
-                # 10-11. Re-verify AFTER keying (plan §10): writing keys must
-                # not have moved anything either. Same tolerance as step 7
-                # (a round-trip restore keeps its historical lean).
-                dg = transforms.evaluated_depsgraph()
-                w_final = transforms.get_pose_bone_world_matrix(
-                    armature, hand, dg)
-                if restored:
-                    _ok = transforms.is_same_transform(
-                        w_before, w_final, 1.0, 45.0)
-                else:
-                    _ok = transforms.is_same_transform(w_before, w_final)
-                if not _ok:
-                    raise WeaponRigError(
-                        "Attach %s moved after keyframing (d-trans %.6f, "
-                        "d-rot %.4f deg). " %
-                        (hand, *transforms.matrix_difference(w_before,
-                                                             w_final)))
-                w_after = w_final
+                # 10-11. Verify AFTER keying (plan §10): writing keys must
+                # not have moved anything either. Exact value checks (no
+                # evaluated reads): fresh inserts leave the depsgraph
+                # cache stale, but RNA + fcurve key values are exact.
+                # Keys provably record the asserted state, so step-7's
+                # w_after stays valid (no re-read: it would hit the stale
+                # cache the exact checks sidestep).
+                _assert_hand(armature, hand, con, _snap)
+                _verify_attach_postkey_exact(
+                    armature, hand, con, frame, _snap, pinned_groups,
+                    seg_name, frozen_ranges)
             else:
                 _verify_influence_key(armature, hand, con.name, frame, 1.0)
 
@@ -799,7 +882,11 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
         # never moves the hand onto the grip (it glues where things are),
         # so a large value means the hand is NOT holding the weapon -- the
         # operator turns this into a guidance warning, never a failure.
-        # (Fresh read: grip world is unaffected by the attach itself.)
+        # (Fresh read: grip world is unaffected by the attach itself.
+        # Assert first: post-key inserts tagged animation dirty, and a
+        # resync here would hand the grip math stale-basis channels.)
+        _assert_hand(armature, hand, con, _snap)
+        _assert_weapon(armature, weapon, _wsnap)
         grip_now = grip_world(armature, side)
         return {
             "side": side,
@@ -812,7 +899,7 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
             "frozen_ranges": frozen_ranges,
             "pinned_groups": pinned_groups,
             "inverse_kept": inverse_kept,
-            "restored": restored,
+            "native_kept_warn": _kept_native_warn,
         }
     finally:
         # Re-enable IK solvers. After that the solver evaluates the now-
@@ -823,6 +910,9 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
         for c, old in _freeze:
             c.active = old
         if _freeze:
+            # Assert before the solver re-evaluation (same resync hazard).
+            _assert_hand(armature, hand, con, _snap)
+            _assert_weapon(armature, weapon, _wsnap)
             dg = transforms.evaluated_depsgraph()
             w_after_ik = transforms.get_pose_bone_world_matrix(
                 armature, hand, dg)
@@ -862,7 +952,7 @@ def preserve_attached_hands(armature, captured):
         con = attached_constraint(armature, side)
         if con is None:
             continue  # detached: constraint off, hand never moved
-        # Measure P with OUR influence at 0 (transient; restored below).
+        # Measure P with OUR influence at 0 (transient).
         con.influence = 0.0
         transforms.update_view_layer()
         dg = transforms.evaluated_depsgraph()
@@ -895,9 +985,7 @@ def detach_preserve_transform(armature, side, frame=None, key=True):
     influence goes to 0 and the hand's local channels are rewritten to hold
     the world transform, then keyed if requested (plan §11 steps 6-7).
     Compensation keys stay gated on `key`: a no-op detach/attach round
-    trip must not touch fcurves at all (the attach restore path reunites
-    RNA with history instead)
-    (and the hold pinning on attach).
+    trip must not touch fcurves at all (and the hold pinning on attach).
     """
     hand = HAND_BONES[side]
     if hand not in armature.data.bones:
@@ -935,6 +1023,11 @@ def detach_preserve_transform(armature, side, frame=None, key=True):
     # 4. Influence 0 (plan §11 step 4).
     con.influence = 0.0
     transforms.update_view_layer()
+    # Snapshot follows the intentional flip; assert repairs an update
+    # resync of the channels (same hazard as attach: mute/influence
+    # writes tag animation dirty, update re-applies fcurve values).
+    _snap = (old_channels, 0.0)
+    _assert_hand(armature, hand, con, _snap)
 
     # 5. Restore world transform by rewriting local channels (plan §11
     #    step 5). pb.matrix setter solves loc/rot for us; parents, rest
@@ -944,7 +1037,11 @@ def detach_preserve_transform(armature, side, frame=None, key=True):
     if not transforms.is_same_transform(w_before, w_after):
         transforms.set_pose_bone_arm_matrix(
             armature, hand, armature.matrix_world.inverted() @ w_before)
+        # Compensation intentionally rewrites channels: snapshot follows
+        # it, then assert repairs any resync before re-reading.
+        _snap = (keyframes.capture_channels(armature, hand), 0.0)
         transforms.update_view_layer()
+        _assert_hand(armature, hand, con, _snap)
         dg = transforms.evaluated_depsgraph()
         w_after = transforms.get_pose_bone_world_matrix(armature, hand, dg)
 
@@ -962,28 +1059,22 @@ def detach_preserve_transform(armature, side, frame=None, key=True):
     # current frame).
     at_current = (frame == bpy.context.scene.frame_current)
     if key:
+        # Key the asserted (intended) values, not resync leftovers.
+        _assert_hand(armature, hand, con, _snap)
         keyed = keyframes.key_changed_channels(armature, hand, frame,
                                                old_channels)
         keyframes.keyframe_influence(armature, hand, con.name, frame, 0.0,
                                       pre_value=_det_pre)
         if at_current:
-            # 8/9. Re-evaluate and verify AFTER keying (plan §11).
-            dg = transforms.evaluated_depsgraph()
-            w_final = transforms.get_pose_bone_world_matrix(
-                armature, hand, dg)
-            if not transforms.is_same_transform(w_before, w_final):
-                raise WeaponRigError(
-                    "Detach %s moved after keyframing (d-trans %.6f, "
-                    "d-rot %.4f deg)." %
-                    (hand, *transforms.matrix_difference(w_before, w_final)))
-            w_after = w_final
+            # 8/9. Verify AFTER keying (plan §11). Exact value checks
+            # (no evaluated reads): fresh inserts leave the depsgraph
+            # cache stale; RNA + fcurve key values are exact.
+            _assert_hand(armature, hand, con, _snap)
+            _verify_detach_postkey_exact(armature, hand, con, frame,
+                                         _snap, keyed)
         else:
             _verify_influence_key(armature, hand, con.name, frame, 0.0)
             _verify_channel_keys(armature, hand, frame, keyed)
 
-    _stash_detach_state(armature, side,
-                        transforms.get_pose_bone_world_matrix(
-                            armature, get_weapon_bone(armature)),
-                        w_after, con.inverse_matrix)
     return {"side": side, "created": False, "had_constraint": True,
             "changed": True, "world_before": w_before, "world_after": w_after}

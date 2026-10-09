@@ -465,12 +465,15 @@ def test_reattach_divergent_preserves_history():
     w1 = hworld().copy()
 
     # Throw: detach @10, move weapon (keyed), free-pose hand, catch @10.
+    # NOTE: key BEFORE updating -- an update with keying-dirt pending
+    # re-applies fcurve values onto RNA (verified evaporation), so the
+    # static pose must be keyed first or the move is silently lost.
     scene.frame_set(10)
     transforms.update_view_layer()
     con_util.detach_preserve_transform(arm, "R", frame=10, key=True)
     arm.pose.bones[weapon].location = (0.6, -0.2, 0.4)
-    transforms.update_view_layer()
     arm.keyframe_insert(wpath, frame=10)
+    transforms.update_view_layer()
     # Pin hand history flat through frame 9 (rest values held so far).
     arm.pose.bones[hand].location = (0.0, 0.0, 0.0)
     transforms.update_view_layer()
@@ -627,7 +630,8 @@ def test_reattach_same_pose_no_segment():
     check("still exactly one main constraint",
           con_util.count_attach_constraints(arm, "R") == 1)
     check("no segment reported", res.get("segment") is None, str(res))
-    check("round-trip restore taken", res.get("restored") is True, str(res))
+    check("inverse kept bit-identical (no-op re-attach)",
+          res.get("inverse_kept") is True, str(res))
     scene.frame_set(1)
     transforms.update_view_layer()
     t, r = transforms.matrix_difference(w1, hworld())
