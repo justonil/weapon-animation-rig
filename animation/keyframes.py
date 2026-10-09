@@ -347,9 +347,13 @@ def pin_hold_channels(armature, bone_name, frame):
     current channel values at ``frame`` with CONSTANT interpolation (the
     hold stays glued until the next key) plus a guard at frame-1 holding
     the evaluated values (pre-existing free motion into the hold is
-    untouched). Groups whose guard matches (static hands) are skipped --
-    zero behavior change there. Only the new key is forced CONSTANT;
-    every other key keeps its interpolation.
+    untouched). Pins are ALWAYS written (even for static values): the
+    CONSTANT key at the attach frame is what keeps later swing keys from
+    blending the hold away, and the guard shields all earlier frames from
+    single-future-key backward leaks. Motion-neutral by construction
+    (guard holds evaluated history, flat holds the current pose). Only
+    the new key is forced CONSTANT; every other key keeps its
+    interpolation.
     Returns the list of pinned channel groups.
     """
     pbone = armature.pose.bones[bone_name]
@@ -364,8 +368,6 @@ def pin_hold_channels(armature, bone_name, frame):
     for group, new in new_values.items():
         path = 'pose.bones["%s"].%s' % (bone_name, group)
         size = len(new)
-        has_fc = any(_find_fcurve_index(armature, path, index) is not None
-                     for index in range(size))
         guard = []
         for index in range(size):
             fc = _find_fcurve_index(armature, path, index)
@@ -377,8 +379,6 @@ def pin_hold_channels(armature, bone_name, frame):
                 except Exception:
                     guard.append(float(new[index]))
         guard = tuple(guard)
-        if has_fc and all(abs(a - b) <= 1e-6 for a, b in zip(guard, new)):
-            continue  # history governs; nothing to pin (plan §31)
         # No history yet (first keys ever: also shields all earlier frames
         # from single-future-key backward leaks) or diverged values.
         _set_channel_group(pbone, group, guard)

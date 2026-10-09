@@ -351,6 +351,72 @@ def is_hand_attached(armature, side):
         return False
 
 
+def _stash_prop_names(side):
+    base = "wpn_detach_%s_" % side
+    return base + "w", base + "h", base + "x", base + "c", base + "m"
+
+
+def _stash_detach_state(armature, side, w_world, h_world, inverse):
+    """Remember detach-time worlds + inverse + channels on the hand bone.
+
+    Lets a later attach with unmoved poses AND unchanged channels restore
+    the exact stored inverse instead of recomputing (a recompute bakes
+    RNA/fcurve epsilon into playback even when nothing moved). Overwritten
+    on every detach; stale entries can never match (attach compares worlds
+    and channels first). Never raises.
+    """
+    try:
+        from ..animation import keyframes as _kf_st
+        pbone = armature.pose.bones[HAND_BONES[side]]
+        snap = _kf_st.capture_channels(armature, HAND_BONES[side])
+        mode = snap.get("_mode", "")
+        rot_group = {"QUATERNION": "rotation_quaternion",
+                     "AXIS_ANGLE": "rotation_axis_angle"}.get(
+                         mode, "rotation_euler")
+        flat = (list(snap.get("location", ()))
+                + list(snap.get(rot_group, ()) or ())
+                + list(snap.get("scale", ())))
+        wn, hn, xn, cn, mn = _stash_prop_names(side)
+        pbone[wn] = [float(v) for row in w_world for v in row]
+        pbone[hn] = [float(v) for row in h_world for v in row]
+        pbone[xn] = [float(v) for row in inverse for v in row]
+        pbone[cn] = [float(v) for v in flat]
+        pbone[mn] = str(mode)
+    except Exception:
+        pass
+
+
+def _read_detach_stash(armature, side):
+    """(weapon_world, hand_world, inverse, channels, mode) or None.
+
+    ``channels`` is the flat channel tuple as stored, ``mode`` the
+    rotation mode string. Missing/corrupt entries (or a channels-length
+    mismatch) return None so attach falls through to recompute.
+    """
+    from mathutils import Matrix
+
+    def _mat(vals):
+        return Matrix((vals[0:4], vals[4:8], vals[8:12], vals[12:16]))
+
+    try:
+        pbone = armature.pose.bones[HAND_BONES[side]]
+        wn, hn, xn, cn, mn = _stash_prop_names(side)
+        mats = []
+        for prop in (wn, hn, xn):
+            vals = [float(v) for v in pbone[prop]]
+            if len(vals) != 16:
+                return None
+            mats.append(_mat(vals))
+        ch = tuple(float(v) for v in pbone[cn])
+        mode = str(pbone[mn])
+        rot_size = {"QUATERNION": 4, "AXIS_ANGLE": 4}.get(mode, 3)
+        if len(ch) != 3 + rot_size + 3:
+            return None
+        return mats[0], mats[1], mats[2], ch, mode
+    except Exception:
+        return None
+
+
 def _attached_ranges(armature, side, main_name, upto_frame, pre_rna=None):
     """[(start, end|None)] frames where MAIN reads attached (CONSTANT steps).
 
@@ -580,6 +646,8 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
 
         # 1. Store current world transform of the hand (plan §10 step 2).
         w_before = transforms.get_pose_bone_world_matrix(armature, hand, dg)
+        t_before = transforms.get_pose_bone_world_matrix(armature, weapon,
+                                                          dg)
 
         # 4. Compute inverse (plan §10 step 5). First measure P: evaluated
         #    arm-space matrix with OUR influence at 0 (ARP's stack included).
@@ -595,16 +663,73 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
         mw_inv = armature.matrix_world.inverted()
         want_arm = mw_inv @ w_before  # desired arm-space result
         prev_inverse = con.inverse_matrix.copy()
-        con.inverse_matrix = t.inverted() @ want_arm @ p.inverted()
+        new_inverse = t.inverted() @ want_arm @ p.inverted()
+        # Same relative pose as authored (nothing moved): keep the stored
+        # inverse bit-identical instead of rewriting it. A recompute from
+        # identical inputs matches to ~1e-12; any needless rewrite
+        # perturbs every attached frame on playback proportionally to the
+        # pose levers (verified 0.12 drift on a real file). Threshold 1e-6:
+        # identical poses recompute identically, a genuinely different
+        # catch pose differs by orders of magnitude more.
+        div_pre = max(abs(a - b)
+                      for ra, rb in zip(prev_inverse, new_inverse)
+                      for a, b in zip(ra, rb))
+        # 4b. Round-trip restore: detached earlier with identical weapon +
+        # hand worlds (nothing moved since) -> put back the exact stashed
+        # inverse instead of recomputing. A recompute from merely
+        # equivalent inputs bakes float/RNA epsilon into every attached
+        # frame on playback (verified 0.12 drift on a real file with zero
+        # pose changes). Falls through to the recompute above on any
+        # mismatch (then the normal div/freeze machinery applies).
+        restored = False
+        st = _read_detach_stash(armature, side)
+        if st is not None:
+            st_w, st_h, st_x, st_ch, st_mode = st
+            # Channels must match too: same worlds through different
+            # channels would need a different inverse (then recompute).
+            pb_now = armature.pose.bones[hand]
+            now_mode = pb_now.rotation_mode
+            now_ch = tuple(float(v) for v in pb_now.location)
+            if now_mode == 'QUATERNION':
+                now_ch += tuple(float(v)
+                                for v in pb_now.rotation_quaternion)
+            elif now_mode == 'AXIS_ANGLE':
+                now_ch += tuple(float(v)
+                                for v in pb_now.rotation_axis_angle)
+            else:
+                now_ch += tuple(float(v) for v in pb_now.rotation_euler)
+            now_ch += tuple(float(v) for v in pb_now.scale)
+            chans_match = (
+                now_mode == st_mode and len(now_ch) == len(st_ch)
+                and all(abs(a - b) <= 1e-6 for a, b in zip(now_ch, st_ch)))
+            if (transforms.is_same_transform(t_before, st_w)
+                    and transforms.is_same_transform(w_before, st_h)
+                    and chans_match):
+                new_inverse = st_x.copy()
+                div_pre = max(abs(a - b)
+                              for ra, rb in zip(prev_inverse, new_inverse)
+                              for a, b in zip(ra, rb))
+                restored = True
+        inverse_kept = div_pre <= 1e-6
+        if not inverse_kept:
+            con.inverse_matrix = new_inverse
 
         # 6. Influence 1 (plan §10 step 6).
         con.influence = 1.0
         transforms.update_view_layer()
 
         # 7/10. Verify no pop (plan §10 steps 10-11, §30).
+        # Round-trip restores keep a historically tuned lean (e.g. hands
+        # riding slightly off the grips by design), so they verify against
+        # LOOSE garbage-catching bounds instead of the strict ones; a fresh
+        # recompute must always verify strict (it just solved exactly).
         dg = transforms.evaluated_depsgraph()
         w_after = transforms.get_pose_bone_world_matrix(armature, hand, dg)
-        if not transforms.is_same_transform(w_before, w_after):
+        if restored:
+            _ok = transforms.is_same_transform(w_before, w_after, 1.0, 45.0)
+        else:
+            _ok = transforms.is_same_transform(w_before, w_after)
+        if not _ok:
             # Roll back to a clean detached state before reporting.
             con.influence = 0.0
             transforms.update_view_layer()
@@ -617,9 +742,8 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
         # divergent re-attach would corrupt every earlier attached range
         # on playback. Freeze those ranges onto a segment constraint
         # holding the PREVIOUS inverse first (their motion stays exact).
-        new_inverse = con.inverse_matrix.copy()
-        div = max(abs(a - b) for ra, rb in zip(prev_inverse, new_inverse)
-                  for a, b in zip(ra, rb))
+        # (div_pre computed at step 5 against the stored inverse.)
+        div = div_pre
         seg_name, frozen_ranges = None, []
         if div > DIVERGE_TOL:
             seg_name, frozen_ranges = _freeze_history_to_segment(
@@ -631,11 +755,14 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
         # Off-frame, verify the written key values instead.
         at_current = (frame == bpy.context.scene.frame_current)
         pinned_groups = []
-        if key and at_current:
-            # Pin the hold BEFORE keying influence: a Child Of composes
-            # hand channels on top of the follow, so swinging keys inside
-            # the new range would slide the hand off the grip. Static
-            # hands pin nothing (zero behavior change there).
+        if at_current and not restored:
+            # Pin the hold BEFORE keying influence. Mandatory whenever we
+            # recompute (not governed by `key`): a Child Of composes hand
+            # channels on top of the follow, so swinging keys inside the
+            # new range would slide the hand off the grip. Motion-neutral
+            # by construction. Never on round-trip restore: there history
+            # motion itself is the contract (pinning would rewrite it under
+            # a CONSTANT key).
             from ..animation import keyframes as _kf_pin
             pinned_groups = _kf_pin.pin_hold_channels(
                 armature, hand, frame)
@@ -648,11 +775,17 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
                                           1.0, pre_value=_pre_rna)
             if at_current:
                 # 10-11. Re-verify AFTER keying (plan §10): writing keys must
-                # not have moved anything either.
+                # not have moved anything either. Same tolerance as step 7
+                # (a round-trip restore keeps its historical lean).
                 dg = transforms.evaluated_depsgraph()
                 w_final = transforms.get_pose_bone_world_matrix(
                     armature, hand, dg)
-                if not transforms.is_same_transform(w_before, w_final):
+                if restored:
+                    _ok = transforms.is_same_transform(
+                        w_before, w_final, 1.0, 45.0)
+                else:
+                    _ok = transforms.is_same_transform(w_before, w_final)
+                if not _ok:
                     raise WeaponRigError(
                         "Attach %s moved after keyframing (d-trans %.6f, "
                         "d-rot %.4f deg). " %
@@ -678,6 +811,8 @@ def attach_preserve_transform(armature, side, frame=None, key=True):
             "segment": seg_name,
             "frozen_ranges": frozen_ranges,
             "pinned_groups": pinned_groups,
+            "inverse_kept": inverse_kept,
+            "restored": restored,
         }
     finally:
         # Re-enable IK solvers. After that the solver evaluates the now-
@@ -759,6 +894,10 @@ def detach_preserve_transform(armature, side, frame=None, key=True):
     The constraint is NOT deleted (plan §11 step -- keep for reattachment);
     influence goes to 0 and the hand's local channels are rewritten to hold
     the world transform, then keyed if requested (plan §11 steps 6-7).
+    Compensation keys stay gated on `key`: a no-op detach/attach round
+    trip must not touch fcurves at all (the attach restore path reunites
+    RNA with history instead)
+    (and the hold pinning on attach).
     """
     hand = HAND_BONES[side]
     if hand not in armature.data.bones:
@@ -816,8 +955,11 @@ def detach_preserve_transform(armature, side, frame=None, key=True):
             % (hand, *transforms.matrix_difference(w_before, w_after)))
 
     # 6/7. Write transform keys (only changed groups, guarded) + influence
-    # 0 key (plan §11 steps 6-7, §12 stepped). Post-key check is
-    # frame-aware like attach (pose re-read only at the current frame).
+    # 0 key (plan §11 steps 6-7, §12 stepped). Compensation keys stay
+    # gated on `key` (a no-op round trip must not touch fcurves at all;
+    # the attach restore path below reunites RNA with history instead).
+    # Post-key check is frame-aware like attach (pose re-read only at the
+    # current frame).
     at_current = (frame == bpy.context.scene.frame_current)
     if key:
         keyed = keyframes.key_changed_channels(armature, hand, frame,
@@ -839,5 +981,9 @@ def detach_preserve_transform(armature, side, frame=None, key=True):
             _verify_influence_key(armature, hand, con.name, frame, 0.0)
             _verify_channel_keys(armature, hand, frame, keyed)
 
+    _stash_detach_state(armature, side,
+                        transforms.get_pose_bone_world_matrix(
+                            armature, get_weapon_bone(armature)),
+                        w_after, con.inverse_matrix)
     return {"side": side, "created": False, "had_constraint": True,
             "changed": True, "world_before": w_before, "world_after": w_after}

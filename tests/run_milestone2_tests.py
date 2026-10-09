@@ -780,8 +780,11 @@ def test_snap_hand_to_weapon(arm):
     t, r = transforms.matrix_difference(l0, l1)
     check("other hand untouched", t <= TOL_TRANSLATION, "d-t=%.6f" % t)
 
-    # 2. Attached hand -> loud error, nothing moved.
-    con_util.attach_preserve_transform(arm, "R", frame=1, key=False)
+    # 2. Attached hand -> loud error, nothing moved. Keyed like the
+    # real wpn.attach operator (which hardcodes key=True): RNA and fcurve
+    # must agree afterwards, or the next update re-syncs RNA from fcurves
+    # and later steps misread the state.
+    con_util.attach_preserve_transform(arm, "R", frame=1, key=True)
     transforms.update_view_layer()
     h_att = world(arm, "c_hand_ik.r")
     try:
@@ -794,7 +797,7 @@ def test_snap_hand_to_weapon(arm):
     t, r = transforms.matrix_difference(h_att, h_att2)
     check("refused snap moves nothing", t <= TOL_TRANSLATION,
           "d-t=%.6f" % t)
-    con_util.detach_preserve_transform(arm, "R", frame=1, key=False)
+    con_util.detach_preserve_transform(arm, "R", frame=1, key=True)
     transforms.update_view_layer()
 
     # 3. Hand home slots: record, move both, recall reproduces G^-1 H.

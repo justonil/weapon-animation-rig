@@ -627,6 +627,7 @@ def test_reattach_same_pose_no_segment():
     check("still exactly one main constraint",
           con_util.count_attach_constraints(arm, "R") == 1)
     check("no segment reported", res.get("segment") is None, str(res))
+    check("round-trip restore taken", res.get("restored") is True, str(res))
     scene.frame_set(1)
     transforms.update_view_layer()
     t, r = transforms.matrix_difference(w1, hworld())
