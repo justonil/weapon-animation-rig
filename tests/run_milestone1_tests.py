@@ -1200,6 +1200,25 @@ def test_reparent_keep_transform():
                   "no exception")
         except WeaponRigError as exc:
             check("reparent under '%s' refused" % bad, True, str(exc))
+    # Armature level (no bone parent): same keep-transform guarantees.
+    lines3, moved3 = rig_reparent.reparent_weapon_bones(arm, None)
+    check("unparent to armature level",
+          set(moved3) == {"weapon", "weapon_aim"}, str(moved3))
+    check("weapon parent cleared",
+          arm.data.bones["weapon"].parent is None,
+          str(arm.data.bones["weapon"].parent))
+    ok3, detail3 = True, ""
+    for f in (1, 5, 10):
+        scene.frame_set(f)
+        transforms.update_view_layer()
+        for bone, want in zip(("weapon", "weapon_aim"), before[f]):
+            t, r = transforms.matrix_difference(want, world(arm, bone))
+            if t > TOL_TRANSLATION or r > TOL_ROTATION_DEG:
+                ok3 = False
+                detail3 += "%s@%d d-t=%.5f d-r=%.4f; " % (bone, f, t, r)
+    check("worlds intact at armature level", ok3, detail3)
+    valid3, text3 = rig_validate.validate_weapon_rig(arm)
+    check("validation accepts armature level", valid3, text3)
 
 
 def build_rig():

@@ -136,23 +136,39 @@ class WPN_OT_reparent_weapon(bpy.types.Operator):
     bl_label = "Reparent Weapon (Keep Transform)"
     bl_options = {'REGISTER', 'UNDO'}
 
+    target: bpy.props.EnumProperty(
+        name="Parent Under",
+        description="New parent: active pose bone, resolved root, "
+                    "or armature level (no bone parent).",
+        items=[("AUTO", "Auto (active bone, else root)", ""),
+               ("ACTIVE", "Active Pose Bone", ""),
+               ("ROOT", "Character Root", ""),
+               ("ARMATURE", "Armature Level (no parent)", "")],
+        default="AUTO",
+    )
+
     def execute(self, context):
         try:
             armature = resolve_armature(context)
         except WeaponRigError as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
-        # Target: active pose bone first (select it, then press the
-        # button); otherwise the resolved character root.
-        target = None
-        active = context.active_pose_bone
-        if active is not None:
-            target = active.name
+        want = self.target
+        if want in ("AUTO", "ACTIVE"):
+            active = context.active_pose_bone
+            if active is not None:
+                target = active.name
+            elif want == "ACTIVE":
+                self.report({'ERROR'}, "No active pose bone selected.")
+                return {'CANCELLED'}
+            else:
+                target, _status = arm_util.resolve_character_root(
+                    armature)
+        elif want == "ROOT":
+            target, _status = arm_util.resolve_character_root(armature)
         else:
-            char_root, _status = arm_util.resolve_character_root(
-                armature)
-            target = char_root
-        if target is None:
+            target = None
+        if target is None and want != "ARMATURE":
             self.report(
                 {'ERROR'},
                 "No target: select a bone first (active bone), or "
@@ -173,7 +189,8 @@ class WPN_OT_reparent_weapon(bpy.types.Operator):
             self.report({'INFO'}, "; ".join(lines))
         else:
             self.report({'INFO'}, "Weapon rig reparented under '%s' "
-                        "(pose + keys preserved)" % target)
+                        "(pose + keys preserved)"
+                        % (target if target is not None else "(armature)"))
         return {'FINISHED'}
 
 

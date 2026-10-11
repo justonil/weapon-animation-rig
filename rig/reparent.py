@@ -209,7 +209,8 @@ def reparent_weapon_bones(armature, new_parent):
         rig_create.bpy_set_mode(armature, 'EDIT')
         for bone_name, (_old, _new) in moved.items():
             eb = armature.data.edit_bones.get(bone_name)
-            eb.parent = armature.data.edit_bones.get(_new)
+            eb.parent = armature.data.edit_bones.get(_new) \
+                if _new is not None else None
         rig_create.bpy_set_mode(armature, 'POSE')
         # Phase 3: rebase channels onto the new parent; overwrite only
         # frames that already have keys (never create new ones).
@@ -271,7 +272,8 @@ def reparent_weapon_bones(armature, new_parent):
             for bone_name, (old, _new) in moved.items():
                 eb = armature.data.edit_bones.get(bone_name)
                 if eb is not None:
-                    eb.parent = armature.data.edit_bones.get(old)
+                    eb.parent = armature.data.edit_bones.get(old) \
+                        if old is not None else None
             rig_create.bpy_set_mode(armature, 'POSE')
             touched = []
             for (bone_name, group, index, f), value in old_keys.items():
@@ -313,7 +315,7 @@ def expected_parent(armature):
             override = bone.get(WPN_PARENT_PROP)
         except Exception:
             override = None
-    if override:
-        return str(override), "override"
+    if override is not None:
+        return (str(override) or None), "override"
     char_root, status = arm_util.resolve_character_root(armature)
     return char_root, status

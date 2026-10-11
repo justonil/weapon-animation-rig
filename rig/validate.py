@@ -87,13 +87,14 @@ def validate_weapon_rig(armature):
                        "%s non-deform (export control)" % BONE_WEAPON))
         from ..rig import reparent as rig_reparent
         exp_parent, exp_status = rig_reparent.expected_parent(armature)
+        exp_show = exp_parent if exp_parent is not None else "(armature)"
         parent = weapon.parent.name if weapon.parent else None
         checks.append((parent == exp_parent,
                        "%s parenting (parent=%s%s)"
                        % (BONE_WEAPON, parent,
                           "" if parent == exp_parent
                           else " -- expected %s%s" % (
-                              exp_parent,
+                              exp_show,
                               " (override)" if exp_status == "override"
                               else ""))))
         for prop in (GRIP_PROPS["R"], GRIP_PROPS["L"],
@@ -111,13 +112,14 @@ def validate_weapon_rig(armature):
     if aim_ours:
         from ..rig import reparent as rig_reparent
         exp_parent, exp_status = rig_reparent.expected_parent(armature)
+        exp_show = exp_parent if exp_parent is not None else "(armature)"
         parent = aim.parent.name if aim.parent else None
         checks.append((parent == exp_parent,
                        "%s parenting (parent=%s%s, must stay independent)"
                        % (BONE_AIM, parent,
                           "" if parent == exp_parent
                           else " -- expected %s%s" % (
-                              exp_parent,
+                              exp_show,
                               " (override)" if exp_status == "override"
                               else ""))))
 
