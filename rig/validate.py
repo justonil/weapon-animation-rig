@@ -85,12 +85,17 @@ def validate_weapon_rig(armature):
     if ours:
         checks.append((not weapon.use_deform,
                        "%s non-deform (export control)" % BONE_WEAPON))
+        from ..rig import reparent as rig_reparent
+        exp_parent, exp_status = rig_reparent.expected_parent(armature)
         parent = weapon.parent.name if weapon.parent else None
-        checks.append((parent == char_root,
+        checks.append((parent == exp_parent,
                        "%s parenting (parent=%s%s)"
                        % (BONE_WEAPON, parent,
-                          "" if parent == char_root
-                          else " -- expected %s" % char_root)))
+                          "" if parent == exp_parent
+                          else " -- expected %s%s" % (
+                              exp_parent,
+                              " (override)" if exp_status == "override"
+                              else ""))))
         for prop in (GRIP_PROPS["R"], GRIP_PROPS["L"],
                      GUARD_PROP_L, GUARD_PROP_R, POMMEL_PROP,
                      CENTER_PROP, TIP_PROP, "blade_axis"):
@@ -104,12 +109,17 @@ def validate_weapon_rig(armature):
         armature, BONE_AIM)
     checks.append((aim_ours, BONE_AIM))
     if aim_ours:
+        from ..rig import reparent as rig_reparent
+        exp_parent, exp_status = rig_reparent.expected_parent(armature)
         parent = aim.parent.name if aim.parent else None
-        checks.append((parent == char_root,
+        checks.append((parent == exp_parent,
                        "%s parenting (parent=%s%s, must stay independent)"
                        % (BONE_AIM, parent,
-                          "" if parent == char_root
-                          else " -- expected %s" % char_root)))
+                          "" if parent == exp_parent
+                          else " -- expected %s%s" % (
+                              exp_parent,
+                              " (override)" if exp_status == "override"
+                              else ""))))
 
     # Attachment constraints (plan §9): exactly one MAIN per side, CHILD_OF,
     # targeting armature + the weapon bone, no duplicates (plan §41).

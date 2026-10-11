@@ -130,11 +130,59 @@ class WPN_OT_toggle_rig_visibility(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WPN_OT_reparent_weapon(bpy.types.Operator):
+    """Move weapon (+aim) under another bone, keeping the world pose."""
+    bl_idname = "wpn.reparent_weapon"
+    bl_label = "Reparent Weapon (Keep Transform)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        try:
+            armature = resolve_armature(context)
+        except WeaponRigError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        # Target: active pose bone first (select it, then press the
+        # button); otherwise the resolved character root.
+        target = None
+        active = context.active_pose_bone
+        if active is not None:
+            target = active.name
+        else:
+            char_root, _status = arm_util.resolve_character_root(
+                armature)
+            target = char_root
+        if target is None:
+            self.report(
+                {'ERROR'},
+                "No target: select a bone first (active bone), or "
+                "create a root bone. Root-like: %s."
+                % ", ".join(arm_util.root_like_candidates(armature)))
+            return {'CANCELLED'}
+        try:
+            from ..rig import reparent as rig_reparent
+            lines, moved = rig_reparent.reparent_weapon_bones(
+                armature, target)
+        except WeaponRigError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        context.scene.wpn_report = "\n".join(lines)
+        for line in lines:
+            print(line)
+        if not moved:
+            self.report({'INFO'}, "; ".join(lines))
+        else:
+            self.report({'INFO'}, "Weapon rig reparented under '%s' "
+                        "(pose + keys preserved)" % target)
+        return {'FINISHED'}
+
+
 CLASSES = (
     WPN_OT_auto_detect,
     WPN_OT_create_rig,
     WPN_OT_validate_rig,
     WPN_OT_toggle_rig_visibility,
+    WPN_OT_reparent_weapon,
 )
 
 

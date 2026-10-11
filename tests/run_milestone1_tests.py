@@ -45,6 +45,7 @@ from weapon_animation_rig.constants import (  # noqa: E402
     WeaponRigError,
 )
 from weapon_animation_rig.rig import create as rig_create  # noqa: E402
+from weapon_animation_rig.rig import reparent as rig_reparent  # noqa: E402
 from weapon_animation_rig.rig import validate as rig_validate  # noqa: E402
 from weapon_animation_rig.utils import armature as arm_util  # noqa: E402
 from weapon_animation_rig.utils import constraints as con_util  # noqa: E402
@@ -1140,6 +1141,67 @@ def test_legacy_ops_without_migration():
     con_util.detach_preserve_transform(arm, "R", frame=1, key=True)
 
 
+def test_reparent_keep_transform():
+    section("Reparent weapon rig under another bone (keep world pose)")
+    arm = build_rig()
+    scene = bpy.context.scene
+    scene.wpn_armature = arm
+    wpath = 'pose.bones["weapon"].location'
+    epath = 'pose.bones["weapon"].rotation_euler'
+    before = {}
+    # Distinct keyed poses at both ends (key BEFORE updating: an update
+    # with keying-dirt pending re-applies fcurve values onto RNA).
+    for f, loc, rot in ((1, (0.3, -0.1, 0.2), (0.2, 0.0, 0.1)),
+                        (10, (-0.2, 0.4, 0.1), (-0.3, 0.2, 0.0))):
+        scene.frame_set(f)
+        wpb = arm.pose.bones["weapon"]
+        wpb.location = loc
+        wpb.rotation_euler = Euler(rot)
+        arm.keyframe_insert(wpath, frame=f)
+        arm.keyframe_insert(epath, frame=f)
+    for f in (1, 5, 10):
+        scene.frame_set(f)
+        transforms.update_view_layer()
+        before[f] = (world(arm, "weapon").copy(),
+                     world(arm, "weapon_aim").copy())
+    scene.frame_set(5)
+    transforms.update_view_layer()
+    lines, moved = rig_reparent.reparent_weapon_bones(arm, "spine_01")
+    check("weapon+aim moved", set(moved) == {"weapon", "weapon_aim"},
+          str(moved))
+    check("weapon under spine_01",
+          arm.data.bones["weapon"].parent.name == "spine_01",
+          str(arm.data.bones["weapon"].parent))
+    check("aim under spine_01",
+          arm.data.bones["weapon_aim"].parent.name == "spine_01",
+          str(arm.data.bones["weapon_aim"].parent))
+    ok, detail = True, ""
+    for f in (1, 5, 10):
+        scene.frame_set(f)
+        transforms.update_view_layer()
+        for bone, want in zip(("weapon", "weapon_aim"), before[f]):
+            t, r = transforms.matrix_difference(want, world(arm, bone))
+            if t > TOL_TRANSLATION or r > TOL_ROTATION_DEG:
+                ok = False
+                detail += "%s@%d d-t=%.5f d-r=%.4f; " % (bone, f, t, r)
+    check("worlds intact at 1/5/10", ok, detail)
+    check("parent override stored",
+          arm.data.bones["weapon"].get("wpn_parent") == "spine_01",
+          str(arm.data.bones["weapon"].get("wpn_parent")))
+    valid, text = rig_validate.validate_weapon_rig(arm)
+    check("validation accepts override parent", valid, text)
+    # Idempotent no-op + refusals.
+    lines2, moved2 = rig_reparent.reparent_weapon_bones(arm, "spine_01")
+    check("already-there no-op", moved2 == {}, str(moved2))
+    for bad in ("weapon", "no_such_bone"):
+        try:
+            rig_reparent.reparent_weapon_bones(arm, bad)
+            check("reparent under '%s' refused" % bad, False,
+                  "no exception")
+        except WeaponRigError as exc:
+            check("reparent under '%s' refused" % bad, True, str(exc))
+
+
 def build_rig():
     """Build an additional mock ARP armature (NO scene reset -- main's `arm`
     must survive) and generate the weapon rig in it."""
@@ -1351,6 +1413,7 @@ def main():
     test_attach_grip_distance_diagnostic()
     test_migration()
     test_legacy_ops_without_migration()
+    test_reparent_keep_transform()
 
     print("\n" + "=" * 70)
     print("RESULT: %d passed, %d failed" % (len(PASS), len(FAIL)))

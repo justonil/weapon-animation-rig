@@ -52,6 +52,8 @@ class WPN_PT_main(bpy.types.Panel):
         col = layout.column(align=True)
         col.operator("wpn.auto_detect", icon='VIEWZOOM')
         col.operator("wpn.create_rig", icon='ADD')
+        if arm is not None and arm.data.bones.get("weapon") is not None:
+            col.operator("wpn.reparent_weapon", icon='LINKED')
         arm = _arm(scene)
         if arm is not None:
             layout.label(text="Character: %s" % arm.name,
