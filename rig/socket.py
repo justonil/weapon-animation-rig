@@ -20,6 +20,8 @@ import bpy
 
 from ..constants import HAND_BONES
 from ..constants import POMMEL_PROP
+from ..constants import GUARD_PROP_L
+from ..constants import GUARD_PROP_R
 from ..constants import WeaponRigError
 from ..utils import constraints as con_util
 from ..utils import transforms
@@ -28,6 +30,53 @@ from ..utils import transforms
 def socket_name(side):
     """Dedicated socket bone name (never collides with the rig)."""
     return "socket_%s" % side.lower()
+
+
+def _socket_frame(armature, weapon, name):
+    """Weapon-local socket rotation (columns X/Y/Z), orthonormal.
+
+    Z runs along the blade (blade_axis prop), X along the tuned guard
+    direction (Gram-Schmidt orthogonalized), Y completes right-handed;
+    X/Y are negated so bone +Y (tail) runs toward the tip while the
+    mesh-matching Z stays put (the 180-degree roll is invisible).
+    """
+    from mathutils import Matrix, Vector
+    bone = armature.data.bones.get(weapon)
+    axis_prop = "+Y"
+    guard_l = guard_r = None
+    try:
+        if bone is not None:
+            axis_prop = bone.get("blade_axis", "+Y")
+            guard_l = bone.get(GUARD_PROP_L)
+            guard_r = bone.get(GUARD_PROP_R)
+    except Exception:
+        pass
+    axes = {"+X": Vector((1.0, 0.0, 0.0)),
+            "-X": Vector((-1.0, 0.0, 0.0)),
+            "+Y": Vector((0.0, 1.0, 0.0)),
+            "-Y": Vector((0.0, -1.0, 0.0)),
+            "+Z": Vector((0.0, 0.0, 1.0)),
+            "-Z": Vector((0.0, 0.0, -1.0))}
+    blade = axes.get(axis_prop, Vector((0.0, 1.0, 0.0))).normalized()
+    guard = None
+    try:
+        if guard_l is not None and guard_r is not None:
+            guard = Vector(tuple(guard_r)) - Vector(tuple(guard_l))
+    except Exception:
+        guard = None
+    if guard is None or guard.length < 1e-6:
+        guard = Vector((1.0, 0.0, 0.0))
+        if abs(blade.dot(guard)) > 0.9:
+            guard = Vector((0.0, 0.0, 1.0))
+    z_s = blade
+    x_s = guard - guard.dot(blade) * blade
+    if x_s.length < 1e-6:
+        raise WeaponRigError(
+            "Socket '%s': guard direction parallel to blade." % name)
+    x_s = x_s.normalized()
+    y_s = z_s.cross(x_s).normalized()
+    cols = [tuple(-x_s), tuple(-y_s), tuple(z_s)]
+    return Matrix(cols).transposed()
 
 
 def _pommel_world(armature, weapon):
@@ -79,19 +128,16 @@ def create_hand_socket(armature, side, hand_bone=None):
         hand_rest = armature.data.bones[hand_bone].matrix_local.copy()
         head_arm = hand_rest @ hand_pose.inverted() @ (
             mw_inv @ pommel_world)
-        axis_prop = None
-        try:
-            axis_prop = armature.data.bones[weapon].get("blade_axis", "+Y")
-        except Exception:
-            axis_prop = "+Y"
-        axes = {"+X": (1.0, 0.0, 0.0), "-X": (-1.0, 0.0, 0.0),
-                "+Y": (0.0, 1.0, 0.0), "-Y": (0.0, -1.0, 0.0),
-                "+Z": (0.0, 0.0, 1.0), "-Z": (0.0, 0.0, -1.0)}
-        blade = (mw_inv @ weapon_world).to_3x3() @ Vector(
-            axes.get(axis_prop, (0.0, 1.0, 0.0)))
-        if blade.length < 1e-6:
-            blade = Vector((0.0, 0.0, 0.02))
-        blade = blade.normalized() * 0.02
+        # Socket frame (weapon-local orthonormal, fully determined):
+        # mesh +Z (blade) == weapon blade_axis, mesh +X (guard bar) ==
+        # the tuned guard direction (verified on the reference rig with
+        # an origin-to-origin bind, +Z blade, and matching prop/geometry
+        # extents). Bone +Y runs toward the tip; the remaining 180-degree
+        # roll is invisible (guard/blade/pommel all 180-symmetric).
+        from mathutils import Matrix
+        wrot = (mw_inv @ weapon_world).to_3x3()
+        m = _socket_frame(armature, weapon, name)
+        tail_arm = head_arm + (wrot @ m).to_3x3() @ Vector((0.0, 0.02, 0.0))
         rig_create.bpy_set_mode(armature, 'EDIT')
         ebones = armature.data.edit_bones
         eb = ebones.get(name)
@@ -104,7 +150,7 @@ def create_hand_socket(armature, side, hand_bone=None):
         eb.use_connect = False
         eb.use_deform = False
         eb.head = head_arm
-        eb.tail = head_arm + blade
+        eb.tail = tail_arm
         rig_create.bpy_set_mode(armature, 'POSE')
         # Verify full matrices (strict): pose-space head/tail reads
         # carry parent-relative semantics, so only whole-matrix
