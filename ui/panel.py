@@ -143,6 +143,11 @@ class WPN_PT_hands(bpy.types.Panel):
         op.side = 'R'
         op = row.operator("wpn.create_hand_socket", text="Socket L")
         op.side = 'L'
+        row = col.row(align=True)
+        op = row.operator("wpn.bake_socket", text="Bake R")
+        op.side = 'R'
+        op = row.operator("wpn.bake_socket", text="Bake L")
+        op.side = 'L'
 
         row = layout.row(align=True)
         row.label(text="Mode:")

@@ -1285,6 +1285,99 @@ def test_hand_socket_seat():
     check("validation ignores socket bone", valid, text)
 
 
+def test_bake_socket_follow():
+    section("Bake weapon motion into socket keys (hand parent kept)")
+    arm = build_rig()
+    scene = bpy.context.scene
+    scene.wpn_armature = arm
+    wpath = 'pose.bones["weapon"].location'
+    epath = 'pose.bones["weapon"].rotation_euler'
+    from weapon_animation_rig.rig import socket as rig_socket
+    lines, name = rig_socket.create_hand_socket(arm, "R")
+    check("socket_r created", name == "socket_r", str(lines))
+    # Authored motion: weapon swings 1->10 (key BEFORE insert).
+    for f, loc, rot in ((1, (0.3, -0.1, 0.2), (0.2, 0.0, 0.1)),
+                        (10, (-0.2, 0.4, 0.1), (-0.3, 0.2, 0.0))):
+        scene.frame_set(f)
+        wpb = arm.pose.bones["weapon"]
+        wpb.location = loc
+        wpb.rotation_euler = Euler(rot)
+        arm.keyframe_insert(wpath, frame=f)
+        arm.keyframe_insert(epath, frame=f)
+    scene.frame_set(1)
+    transforms.update_view_layer()
+    from weapon_animation_rig.animation import keyframes as kfmod
+    n_w_before = len(kfmod._find_fcurve_index(arm, wpath, 0).
+                      keyframe_points)
+    hpath = 'pose.bones["c_hand_ik.r"].location'
+    hfc = kfmod._find_fcurve_index(arm, hpath, 0)
+    n_h_before = len(hfc.keyframe_points) if hfc is not None else 0
+    scene.frame_set(5)
+    transforms.update_view_layer()
+    w5_before = world(arm, "weapon").copy()
+    h5_before = world(arm, "c_hand_ik.r").copy()
+    blines, gap = rig_socket.bake_socket_follow(arm, "R")
+    check("bake ok", gap <= TOL_TRANSLATION, str(blines))
+    # Keys landed: 10 frames x location+euler, all LINEAR.
+    spath = 'pose.bones["socket_r"].location'
+    sepath = 'pose.bones["socket_r"].rotation_euler'
+    ok_keys, detail = True, ""
+    for path, size in ((spath, 3), (sepath, 3)):
+        for index in range(size):
+            fc = kfmod._find_fcurve_index(arm, path, index)
+            if fc is None or len(fc.keyframe_points) != 10:
+                ok_keys = False
+                detail += "%s[%d] keys=%s; " % (
+                    path, index,
+                    len(fc.keyframe_points) if fc is not None else None)
+            elif any(k.interpolation != 'LINEAR'
+                     for k in fc.keyframe_points):
+                ok_keys = False
+                detail += "%s[%d] not LINEAR; " % (path, index)
+    check("socket keys 1..10 LINEAR", ok_keys, detail)
+    # Exact follow on every frame (sword on socket == authored weapon).
+    ok_fw, detail_fw = True, ""
+    for f in range(1, 11):
+        scene.frame_set(f)
+        transforms.update_view_layer()
+        mesh_frame = rig_socket._mesh_frame(arm, "weapon", "socket_r")
+        want = world(arm, "weapon") @ mesh_frame
+        got = world(arm, "socket_r")
+        t, r = transforms.matrix_difference(want, got)
+        if t > TOL_TRANSLATION or r > TOL_ROTATION_DEG:
+            ok_fw = False
+            detail_fw += "f%d d-t=%.5f d-r=%.4f; " % (f, t, r)
+    check("socket reproduces weapon 1..10", ok_fw, detail_fw)
+    # Nothing else touched: weapon/hand key counts + weapon world.
+    n_w_after = len(kfmod._find_fcurve_index(arm, wpath, 0).
+                     keyframe_points)
+    hfc2 = kfmod._find_fcurve_index(arm, hpath, 0)
+    n_h_after = len(hfc2.keyframe_points) if hfc2 is not None else 0
+    check("weapon/hand keys untouched",
+          n_w_after == n_w_before and n_h_after == n_h_before,
+          "w %d->%d h %d->%d" % (n_w_before, n_w_after,
+                                  n_h_before, n_h_after))
+    scene.frame_set(5)
+    transforms.update_view_layer()
+    t5, r5 = transforms.matrix_difference(w5_before, world(arm, "weapon"))
+    th5, _rh5 = transforms.matrix_difference(h5_before,
+                                              world(arm, "c_hand_ik.r"))
+    check("weapon/hand worlds intact at f5",
+          t5 <= TOL_TRANSLATION and r5 <= TOL_ROTATION_DEG
+          and th5 <= TOL_TRANSLATION,
+          "w d-t=%.5f d-r=%.4f h d-t=%.5f" % (t5, r5, th5))
+    check("socket still under R hand",
+          arm.data.bones["socket_r"].parent.name == "c_hand_ik.r",
+          str(arm.data.bones["socket_r"].parent))
+    # Double-bake refused.
+    try:
+        rig_socket.bake_socket_follow(arm, "R")
+        check("double bake refused", False, "no exception")
+    except WeaponRigError as exc:
+        check("double bake refused", "already has keys" in str(exc),
+              str(exc))
+
+
 def build_rig():
     """Build an additional mock ARP armature (NO scene reset -- main's `arm`
     must survive) and generate the weapon rig in it."""
@@ -1498,6 +1591,7 @@ def main():
     test_legacy_ops_without_migration()
     test_reparent_keep_transform()
     test_hand_socket_seat()
+    test_bake_socket_follow()
 
     print("\n" + "=" * 70)
     print("RESULT: %d passed, %d failed" % (len(PASS), len(FAIL)))

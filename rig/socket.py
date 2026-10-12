@@ -15,11 +15,20 @@ every blend weight, always. (When attached, the hand already tracks the
 weapon, so the static socket tracks authored weapon motion transitively
 -- pivots and spins included. Detached flight (throw) is a state switch
 in game code: hand socket while held, weapon bone while thrown.)
+
+Baked follow (bake_socket_follow) extends the static seat across a
+range: per-frame local keys reproduce the authored weapon motion
+EXACTLY while the parent stays the hand, so blends carry the sword
+with the hand side. Static seat = the bind frame; baked keys = every
+other frame. A static hand-child socket provably cannot reproduce
+weapon motion under wrist articulation (hand^-1 @ weapon must be
+constant, and it is not) -- keys are the only exact carrier.
 """
 import bpy
 
 from ..constants import HAND_BONES
 from ..constants import POMMEL_PROP
+from ..constants import TIP_PROP
 from ..constants import GUARD_PROP_L
 from ..constants import GUARD_PROP_R
 from ..constants import TOL_ROTATION_DEG
@@ -245,6 +254,250 @@ def create_hand_socket(armature, side, hand_bone=None):
             pass
         return lines, name
     finally:
+        try:
+            if armature.mode != prev_object_mode:
+                rig_create.bpy_set_mode(armature, prev_object_mode)
+        except Exception:
+            pass
+
+
+def _channel_key_frames(armature, bone_name, groups):
+    """Sorted key frames over channel groups (floats, any index)."""
+    from ..animation import keyframes
+    frames = set()
+    for group in groups:
+        path = 'pose.bones["%s"].%s' % (bone_name, group)
+        for index in range(4):
+            fc = keyframes._find_fcurve_index(armature, path, index)
+            if fc is None:
+                if index >= 3:
+                    break
+                continue
+            for key in fc.keyframe_points:
+                frames.add(float(key.co[0]))
+    return sorted(frames)
+
+
+def _baked_groups(pbone):
+    """Channel groups the bake reads (location/rotation/scale)."""
+    mode = pbone.rotation_mode
+    rot = {"QUATERNION": "rotation_quaternion",
+           "AXIS_ANGLE": "rotation_axis_angle"}.get(
+               mode, "rotation_euler")
+    return ("location", rot, "scale")
+
+
+def _bake_span(armature, weapon, hand):
+    """Integer (start, end) covering weapon+hand channel keys."""
+    frames = set()
+    for bone_name in (weapon, hand):
+        pbone = armature.pose.bones.get(bone_name)
+        if pbone is None:
+            continue
+        for f in _channel_key_frames(armature, bone_name,
+                                     _baked_groups(pbone)):
+            frames.add(f)
+    if not frames:
+        raise WeaponRigError(
+            "Nothing to bake: no weapon/hand keys in this action.")
+    for f in sorted(frames):
+        if abs(f - round(f)) > 1e-4:
+            raise WeaponRigError(
+                "Cannot bake: subframe key at %s (re-key it on a whole "
+                "frame first; keyframe_insert drops subframes silently)."
+                % (f,))
+    return int(round(min(frames))), int(round(max(frames)))
+
+
+def _socket_has_keys(armature, name):
+    """True if the socket already carries any transform keys."""
+    from ..animation import keyframes
+    for group in ("location", "rotation_euler", "rotation_quaternion",
+                  "rotation_axis_angle", "scale"):
+        path = 'pose.bones["%s"].%s' % (name, group)
+        for index in range(4):
+            fc = keyframes._find_fcurve_index(armature, path, index)
+            if fc is not None and len(fc.keyframe_points):
+                return True
+    return False
+
+
+def _remove_socket_keys(armature, name):
+    """Best-effort rollback: drop the socket's transform keys."""
+    from ..animation import keyframes
+    for group in ("location", "rotation_euler", "rotation_quaternion",
+                  "rotation_axis_angle", "scale"):
+        path = 'pose.bones["%s"].%s' % (name, group)
+        for index in range(4):
+            fc = keyframes._find_fcurve_index(armature, path, index)
+            if fc is None:
+                if index >= 3:
+                    break
+                continue
+            try:
+                for key in reversed(list(fc.keyframe_points)):
+                    try:
+                        fc.keyframe_points.remove(key)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                fc.update()
+            except Exception:
+                pass
+
+
+def _mesh_frame(armature, weapon, name):
+    """Constant weapon-local mesh frame: Translation(pommel) @ map."""
+    from mathutils import Matrix, Vector
+    bone = armature.data.bones.get(weapon)
+    pommel = Vector(tuple(bone.get(POMMEL_PROP, (0.0, 0.0, 0.0))))
+    return (Matrix.Translation(pommel)
+            @ _socket_frame(armature, weapon, name).to_4x4())
+
+
+def _tip_distance(armature, weapon):
+    """Pommel->tip distance along the blade (mesh tip lever)."""
+    from mathutils import Vector
+    bone = armature.data.bones.get(weapon)
+    tip = Vector(tuple(bone.get(TIP_PROP, (0.0, 1.10, 0.0))))
+    pommel = Vector(tuple(bone.get(POMMEL_PROP, (0.0, 0.0, 0.0))))
+    return (tip - pommel).length
+
+
+def bake_socket_follow(armature, side, hand_bone=None):
+    """Key the socket so a snapped sword reproduces weapon motion exactly.
+
+    Per integer frame of the weapon+hand key span: desired socket world
+    = weapon_world @ M (M = constant weapon-local mesh frame), written
+    into the socket's local channels (the matrix setter accounts for
+    the hand parent) and keyed (location + euler rotation, LINEAR).
+    The parent stays the hand: blends carry the sword with the hand
+    side, while at weight 1 the placement is bit-exact authoring.
+
+    Touches NOTHING but the socket bone (its channels + its keys): no
+    weapon/hand RNA writes, no other keys, no rest edits. Strict verify
+    (socket world vs desired, plus tip GAP) with key rollback on
+    mismatch. Refuses pre-keyed sockets (double-bake would corrupt).
+    Returns (report_lines, max_tip_gap).
+    """
+    from ..rig import create as rig_create
+    from ..animation import keyframes
+    weapon = con_util.get_weapon_bone(armature)
+    if hand_bone is None:
+        hand_bone = HAND_BONES.get(side, HAND_BONES["R"])
+    name = socket_name(side)
+    if name not in armature.data.bones:
+        raise WeaponRigError(
+            "Cannot bake: no '%s' -- create the socket first." % name)
+    if hand_bone not in armature.data.bones:
+        raise WeaponRigError(
+            "Cannot bake: hand bone '%s' missing." % hand_bone)
+    parent = armature.data.bones[name].parent
+    if parent is None or parent.name != hand_bone:
+        raise WeaponRigError(
+            "Cannot bake: '%s' is not under '%s' (re-seat the socket)."
+            % (name, hand_bone))
+    if _socket_has_keys(armature, name):
+        raise WeaponRigError(
+            "Cannot bake: '%s' already has keys (delete them first -- "
+            "double-bake would corrupt the follow)." % name)
+    start, end = _bake_span(armature, weapon, hand_bone)
+    from mathutils import Vector
+    mesh_frame = _mesh_frame(armature, weapon, name)
+    tip_dist = _tip_distance(armature, weapon)
+    bone = armature.data.bones.get(weapon)
+    tip_local = Vector(tuple(bone.get(TIP_PROP, (0.0, 1.10, 0.0))))
+    mw = armature.matrix_world.copy()
+    mw_inv = mw.inverted()
+    context = bpy.context
+    cur_frame = int(context.scene.frame_current)
+    prev_object_mode = armature.mode
+    rig_create._make_active(context, armature)
+    sock = armature.pose.bones.get(name)
+    prev_rot_mode = sock.rotation_mode
+    lpath = 'pose.bones["%s"].location' % name
+    rpath = 'pose.bones["%s"].rotation_euler' % name
+    try:
+        rig_create.bpy_set_mode(armature, 'POSE')
+        sock.rotation_mode = 'XYZ'
+        for f in range(start, end + 1):
+            context.scene.frame_set(f)
+            transforms.update_view_layer()
+            want = transforms.get_pose_bone_world_matrix(
+                armature, weapon) @ mesh_frame
+            transforms.set_pose_bone_arm_matrix(
+                armature, name, mw_inv @ want)
+            if not armature.keyframe_insert(lpath, frame=f):
+                raise WeaponRigError(
+                    "Failed to bake key '%s' at frame %d." % (lpath, f))
+            if not armature.keyframe_insert(rpath, frame=f):
+                raise WeaponRigError(
+                    "Failed to bake key '%s' at frame %d." % (rpath, f))
+        # LINEAR: predictable, no overshoot between dense keys.
+        for group, size in ((lpath, 3), (rpath, 3)):
+            for index in range(size):
+                fc = keyframes._find_fcurve_index(armature, group, index)
+                if fc is None:
+                    raise WeaponRigError(
+                        "Bake lost fcurve '%s'[%d]." % (group, index))
+                for key in fc.keyframe_points:
+                    key.interpolation = 'LINEAR'
+                try:
+                    fc.update()
+                except Exception:
+                    pass
+        # Verify every frame: socket world vs desired + tip GAP.
+        max_gap = 0.0
+        max_solve = 0.0
+        for f in range(start, end + 1):
+            context.scene.frame_set(f)
+            transforms.update_view_layer()
+            want = transforms.get_pose_bone_world_matrix(
+                armature, weapon) @ mesh_frame
+            got = transforms.get_pose_bone_world_matrix(armature, name)
+            trans, rot = transforms.matrix_difference(want, got)
+            max_solve = max(max_solve, trans)
+            if trans > TOL_TRANSLATION or rot > TOL_ROTATION_DEG:
+                raise WeaponRigError(
+                    "Bake verify failed at frame %d (d-trans %.6f, "
+                    "d-rot %.4f deg) -- keys rolled back."
+                    % (f, trans, rot))
+            tip_want = transforms.get_pose_bone_world_matrix(
+                armature, weapon) @ tip_local
+            tip_got = got @ Vector((0.0, 0.0, tip_dist))
+            gap = (tip_want - tip_got).length
+            max_gap = max(max_gap, gap)
+            if gap > TOL_TRANSLATION:
+                raise WeaponRigError(
+                    "Bake tip GAP %.6f at frame %d -- keys rolled back."
+                    % (gap, f))
+        context.scene.frame_set(cur_frame)
+        transforms.update_view_layer()
+        n = end - start + 1
+        lines = ["Socket '%s' baked %d..%d (%d frames): sword on socket "
+                 "== authored weapon motion (max tip GAP %.6f, max "
+                 "solve d-trans %.6f). Parent still '%s'; weapon/hand "
+                 "untouched." %
+                 (name, start, end, n, max_gap, max_solve, hand_bone)]
+        return lines, max_gap
+    except Exception:
+        try:
+            sock.rotation_mode = prev_rot_mode
+        except Exception:
+            pass
+        _remove_socket_keys(armature, name)
+        try:
+            context.scene.frame_set(cur_frame)
+            transforms.update_view_layer()
+        except Exception:
+            pass
+        raise
+    finally:
+        # NOTE: rotation mode stays XYZ on success (the keys are euler;
+        # restoring anything else would misread them). Only the object
+        # mode is restored here; failure path restores rotation above.
         try:
             if armature.mode != prev_object_mode:
                 rig_create.bpy_set_mode(armature, prev_object_mode)

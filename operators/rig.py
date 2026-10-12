@@ -229,6 +229,38 @@ class WPN_OT_create_hand_socket(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WPN_OT_bake_socket(bpy.types.Operator):
+    """Bake authored weapon motion into the hand socket's keys."""
+    bl_idname = "wpn.bake_socket"
+    bl_label = "Bake Socket Follow"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    side: bpy.props.EnumProperty(
+        name="Side",
+        items=[("R", "Right", ""), ("L", "Left", "")],
+        default="R",
+    )
+
+    def execute(self, context):
+        try:
+            armature = resolve_armature(context)
+        except WeaponRigError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        try:
+            from ..rig import socket as rig_socket
+            lines, _gap = rig_socket.bake_socket_follow(
+                armature, self.side)
+        except WeaponRigError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        context.scene.wpn_report = "\n".join(lines)
+        for line in lines:
+            print(line)
+        self.report({'INFO'}, "; ".join(lines))
+        return {'FINISHED'}
+
+
 CLASSES = (
     WPN_OT_auto_detect,
     WPN_OT_create_rig,
@@ -236,6 +268,7 @@ CLASSES = (
     WPN_OT_toggle_rig_visibility,
     WPN_OT_reparent_weapon,
     WPN_OT_create_hand_socket,
+    WPN_OT_bake_socket,
 )
 
 
