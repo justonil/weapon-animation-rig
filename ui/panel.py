@@ -138,6 +138,11 @@ class WPN_PT_hands(bpy.types.Panel):
         op.side = 'BOTH'
         op = row.operator("wpn.detach", text="Detach Both")
         op.side = 'BOTH'
+        row = col.row(align=True)
+        op = row.operator("wpn.create_hand_socket", text="Socket R")
+        op.side = 'R'
+        op = row.operator("wpn.create_hand_socket", text="Socket L")
+        op.side = 'L'
 
         row = layout.row(align=True)
         row.label(text="Mode:")

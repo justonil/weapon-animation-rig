@@ -1235,6 +1235,45 @@ def test_reparent_keep_transform():
           set(moved4) == {"weapon", "weapon_aim"}, str(moved4))
 
 
+def test_hand_socket_seat():
+    section("Hand socket bone for engine placement (static offset)")
+    arm = build_rig()
+    scene = bpy.context.scene
+    scene.wpn_armature = arm
+    scene.frame_set(1)
+    transforms.update_view_layer()
+    from weapon_animation_rig.rig import socket as rig_socket
+    lines, name = rig_socket.create_hand_socket(arm, "R")
+    check("socket_r created", name == "socket_r", str(lines))
+    check("socket under R hand",
+          arm.data.bones["socket_r"].parent.name == "c_hand_ik.r",
+          str(arm.data.bones["socket_r"].parent))
+    check("socket non-deform",
+          not arm.data.bones["socket_r"].use_deform, "deform on!")
+    # Head sits exactly on the mesh-origin-when-held (pommel) point.
+    from mathutils import Vector
+    dg = transforms.evaluated_depsgraph()
+    eval_arm = arm.evaluated_get(dg)
+    sock_w = (eval_arm.matrix_world
+              @ eval_arm.pose.bones["socket_r"].head).copy()
+    wpb = eval_arm.pose.bones["weapon"]
+    weapon_w = eval_arm.matrix_world @ wpb.matrix
+    pommel = Vector(tuple(
+        arm.data.bones["weapon"].get("pommel", (0.0, 0.0, 0.0))))
+    want = weapon_w @ pommel
+    check("socket head on pommel point",
+          (sock_w - want).length <= TOL_TRANSLATION,
+          "d=%.6f" % (sock_w - want).length)
+    # Idempotent re-seat + validation blind to extras.
+    lines2, name2 = rig_socket.create_hand_socket(arm, "R")
+    check("re-seat no duplicate", name2 == "socket_r", str(lines2))
+    check("still one socket_r",
+          sum(1 for b in arm.data.bones if b.name == "socket_r") == 1,
+          "dup!")
+    valid, text = rig_validate.validate_weapon_rig(arm)
+    check("validation ignores socket bone", valid, text)
+
+
 def build_rig():
     """Build an additional mock ARP armature (NO scene reset -- main's `arm`
     must survive) and generate the weapon rig in it."""
@@ -1447,6 +1486,7 @@ def main():
     test_migration()
     test_legacy_ops_without_migration()
     test_reparent_keep_transform()
+    test_hand_socket_seat()
 
     print("\n" + "=" * 70)
     print("RESULT: %d passed, %d failed" % (len(PASS), len(FAIL)))

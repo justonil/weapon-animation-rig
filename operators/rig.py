@@ -194,12 +194,48 @@ class WPN_OT_reparent_weapon(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WPN_OT_create_hand_socket(bpy.types.Operator):
+    """Seat a static engine socket bone under a hand (mesh origin)."""
+    bl_idname = "wpn.create_hand_socket"
+    bl_label = "Create Hand Socket"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    side: bpy.props.EnumProperty(
+        name="Side",
+        items=[("R", "Right", ""), ("L", "Left", "")],
+        default="R",
+    )
+
+    def execute(self, context):
+        try:
+            armature = resolve_armature(context)
+        except WeaponRigError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        try:
+            from ..rig import socket as rig_socket
+            lines, name = rig_socket.create_hand_socket(
+                armature, self.side)
+        except WeaponRigError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        context.scene.wpn_report = "\n".join(lines)
+        for line in lines:
+            print(line)
+            if line.startswith("WARNING"):
+                self.report({'WARNING'}, line)
+        self.report({'INFO'}, "Socket '%s' ready (bind at current "
+                    "frame)" % name)
+        return {'FINISHED'}
+
+
 CLASSES = (
     WPN_OT_auto_detect,
     WPN_OT_create_rig,
     WPN_OT_validate_rig,
     WPN_OT_toggle_rig_visibility,
     WPN_OT_reparent_weapon,
+    WPN_OT_create_hand_socket,
 )
 
 
