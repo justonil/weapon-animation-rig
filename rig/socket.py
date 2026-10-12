@@ -20,6 +20,10 @@ import bpy
 
 from ..constants import HAND_BONES
 from ..constants import POMMEL_PROP
+from ..constants import GUARD_PROP_L
+from ..constants import GUARD_PROP_R
+from ..constants import TOL_ROTATION_DEG
+from ..constants import TOL_TRANSLATION
 from ..constants import WeaponRigError
 from ..utils import constraints as con_util
 from ..utils import transforms
@@ -28,6 +32,53 @@ from ..utils import transforms
 def socket_name(side):
     """Dedicated socket bone name (never collides with the rig)."""
     return "socket_%s" % side.lower()
+
+
+def _socket_frame(armature, weapon, name):
+    """Weapon-local socket rotation (columns X/Y/Z), orthonormal.
+
+    Pure mesh mapping, no negations: X along the tuned guard direction
+    (Gram-Schmidt orthogonalized vs the blade), Z along the blade
+    (blade_axis prop), Y = Z x X completing right-handed. Determinant
+    +1 by construction; mesh +X/+Y/+Z land on socket X/Y/Z exactly.
+    """
+    from mathutils import Matrix, Vector
+    bone = armature.data.bones.get(weapon)
+    axis_prop = "+Y"
+    guard_l = guard_r = None
+    try:
+        if bone is not None:
+            axis_prop = bone.get("blade_axis", "+Y")
+            guard_l = bone.get(GUARD_PROP_L)
+            guard_r = bone.get(GUARD_PROP_R)
+    except Exception:
+        pass
+    axes = {"+X": Vector((1.0, 0.0, 0.0)),
+            "-X": Vector((-1.0, 0.0, 0.0)),
+            "+Y": Vector((0.0, 1.0, 0.0)),
+            "-Y": Vector((0.0, -1.0, 0.0)),
+            "+Z": Vector((0.0, 0.0, 1.0)),
+            "-Z": Vector((0.0, 0.0, -1.0))}
+    blade = axes.get(axis_prop, Vector((0.0, 1.0, 0.0))).normalized()
+    guard = None
+    try:
+        if guard_l is not None and guard_r is not None:
+            guard = Vector(tuple(guard_r)) - Vector(tuple(guard_l))
+    except Exception:
+        guard = None
+    if guard is None or guard.length < 1e-6:
+        guard = Vector((1.0, 0.0, 0.0))
+        if abs(blade.dot(guard)) > 0.9:
+            guard = Vector((0.0, 0.0, 1.0))
+    z_s = blade
+    x_s = guard - guard.dot(blade) * blade
+    if x_s.length < 1e-6:
+        raise WeaponRigError(
+            "Socket '%s': guard direction parallel to blade." % name)
+    x_s = x_s.normalized()
+    y_s = z_s.cross(x_s).normalized()
+    cols = [tuple(x_s), tuple(y_s), tuple(z_s)]
+    return Matrix(cols).transposed()
 
 
 def _pommel_world(armature, weapon):
@@ -65,7 +116,6 @@ def create_hand_socket(armature, side, hand_bone=None):
     prev_object_mode = armature.mode
     rig_create._make_active(context, armature)
     try:
-        from mathutils import Vector
         pommel_world, weapon_world = _pommel_world(armature, weapon)
         mw_inv = armature.matrix_world.inverted()
         # Rest-expressed seat: the head is stored as REST (edit-bone
@@ -79,45 +129,74 @@ def create_hand_socket(armature, side, hand_bone=None):
         hand_rest = armature.data.bones[hand_bone].matrix_local.copy()
         head_arm = hand_rest @ hand_pose.inverted() @ (
             mw_inv @ pommel_world)
-        # Socket frame = weapon frame translated to the seat point:
-        # the bone LOOKS along the blade (tail toward the tip, as
-        # expected) and MUST be used with Keep-Relative attach rules
-        # (rigid offset follow, never full re-snap: a full snap would
-        # map mesh +Z (blade) onto socket Z (perp to blade) -- 90 deg
-        # off by construction, for ANY tail direction but this one's
-        # correct rigid follow. See module docstring.
+        # Full rest matrix (NOT head/tail: head/tail leave roll at its
+        # default, so the bone orientation never equals the mesh frame
+        # (bisected 3.35 m tip miss on an exact head seat). The rest
+        # matrix carries position AND the mesh-mapped orientation:
+        # mesh +Z (blade) lands on blade_axis, mesh +X (guard bar) on
+        # the tuned guard direction, Y completes right-handed (verified
+        # on the reference origin-to-origin bind and matching
+        # prop/geometry extents). EditBone.matrix assignment decomposes
+        # it into head/tail/roll automatically.
+        from mathutils import Matrix
         wrot = (mw_inv @ weapon_world).to_3x3()
-        try:
-            _axis_prop = armature.data.bones[weapon].get(
-                "blade_axis", "+Y")
-        except Exception:
-            _axis_prop = "+Y"
-        _axes = {"+X": Vector((1.0, 0.0, 0.0)),
-                 "-X": Vector((-1.0, 0.0, 0.0)),
-                 "+Y": Vector((0.0, 1.0, 0.0)),
-                 "-Y": Vector((0.0, -1.0, 0.0)),
-                 "+Z": Vector((0.0, 0.0, 1.0)),
-                 "-Z": Vector((0.0, 0.0, -1.0))}
-        tail_arm = head_arm + (wrot @ _axes.get(
-            _axis_prop, Vector((0.0, 1.0, 0.0)))) * 0.02
+        m = _socket_frame(armature, weapon, name)
+        # Full 4x4 chain (never to_3x3 mid-chain: that drops the
+        # translational coupling): REST is what the hand carries back
+        # to exactly desired_world at bind. Verifiable by algebra:
+        # mw @ hand_pose @ hand_rest^-1 @ REST == desired_world.
+        desired_world = Matrix.Translation(pommel_world) @ \
+            (armature.matrix_world.to_3x3() @ wrot @ m).to_4x4()
+        rest_mat = hand_rest @ hand_pose.inverted() @ mw_inv @ \
+            desired_world
+        # Rest orientation columns (armature space) for explicit roll.
+        rest_rot = rest_mat.to_3x3()
+        _rx = rest_rot.col[0].normalized()
+        _ry = rest_rot.col[1].normalized()
         rig_create.bpy_set_mode(armature, 'EDIT')
         ebones = armature.data.edit_bones
         eb = ebones.get(name)
         created = eb is None
         if created:
             eb = ebones.new(name)
-        # Parent FIRST, then head/tail: assigning a parent can shift
-        # explicitly-set heads otherwise (bisected 0.72 seat miss).
+        import math as _math
         eb.parent = ebones.get(hand_bone)
         eb.use_connect = False
         eb.use_deform = False
         eb.head = head_arm
-        eb.tail = tail_arm
+        eb.tail = head_arm + _ry * 0.02
+        # Closed-loop roll: head/tail fix Y; rotate X toward desired
+        # about Y until it matches. No assumptions about Blender's
+        # roll-0 convention or sign: each pass measures the ACTUAL
+        # frame and corrects the residual (roll is 1-DOF additive
+        # about bone Y, so this converges in ~2 passes).
+        for _it in range(3):
+            try:
+                armature.update_from_editmode()
+            except Exception:
+                pass
+            _cur = eb.matrix.to_3x3()
+            _cx = _cur.col[0].normalized()
+            _cy = _cur.col[1].normalized()
+            _cross = _cx.cross(_rx)
+            _ang = _math.atan2(_cross.dot(_cy), _cx.dot(_rx))
+            if abs(_ang) < 1e-6:
+                break
+            try:
+                _cur_roll = float(eb.roll)
+            except Exception:
+                _cur_roll = 0.0
+            eb.roll = _cur_roll + _ang
+        try:
+            armature.update_from_editmode()
+        except Exception:
+            pass
         rig_create.bpy_set_mode(armature, 'POSE')
-        # Verify full matrices (strict): pose-space head/tail reads
-        # carry parent-relative semantics, so only whole-matrix
-        # comparison is meaningful. Rollback = remove the bone we just
-        # created; pose/keys of weapon and hand are untouched otherwise.
+        # Verify full matrices (strict, translation AND rotation):
+        # pose-space head/tail reads carry parent-relative semantics,
+        # so only whole-matrix comparison is meaningful. Rollback =
+        # remove the bone we just created; pose/keys of weapon and hand
+        # are untouched otherwise.
         from mathutils import Matrix
         transforms.update_view_layer()
         dg2 = transforms.evaluated_depsgraph()
@@ -126,17 +205,19 @@ def create_hand_socket(armature, side, hand_bone=None):
         hand_pb = eval2.pose.bones.get(hand_bone)
         err = 1e9
         if sock_pb is not None and hand_pb is not None:
-            # Rigid-child model: socket rides the hand from bind head.
-            # Translation only: rest orientation is the bone's own and
-            # is not part of the seat contract (roll is user-tweaked).
+            # Rigid-child model: socket rides the hand from bind matrix.
             hand_rest2 = armature.data.bones[
                 hand_bone].matrix_local.copy()
             exp = eval2.matrix_world @ hand_pb.matrix @ \
-                hand_rest2.inverted() @ \
-                Matrix.Translation(head_arm)
+                hand_rest2.inverted() @ rest_mat
             got = eval2.matrix_world @ sock_pb.matrix
-            err = (exp.translation - got.translation).length
-        if err > 1e-4:
+            trans, rot = transforms.matrix_difference(exp, got)
+            if rot > TOL_ROTATION_DEG:
+                raise WeaponRigError(
+                    "Socket '%s' orientation off by %.4f deg "
+                    "(rolled back)." % (name, rot))
+            err = trans
+        if err > TOL_TRANSLATION:
             if created:
                 rig_create.bpy_set_mode(armature, 'EDIT')
                 doomed = armature.data.edit_bones.get(name)
