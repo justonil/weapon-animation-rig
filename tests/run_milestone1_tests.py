@@ -1264,16 +1264,15 @@ def test_hand_socket_seat():
     check("socket head on pommel point",
           (sock_w - want).length <= TOL_TRANSLATION,
           "d=%.6f" % (sock_w - want).length)
-    # Tail is perp to the blade BY CONSTRUCTION (auto-exact snap frame:
-    # socket Z carries the blade, so +Y cannot -- any full snap needs
-    # exactly this; tail-to-tip only pairs with Keep-Relative).
+    # Tail points to the Tip (socket Y = blade after the 90 deg X
+    # rotation): the orientation Unreal's socket attach expects.
     _sb = arm.data.bones["socket_r"]
     _taildir = (Vector(tuple(_sb.tail_local)) - Vector(tuple(_sb.head_local)))
     # Rest-vs-rest: tail is a rest-space vector (bind pose is the seat).
     _wY = arm.data.bones["weapon"].matrix_local.to_3x3() @ \
         Vector((0.0, 1.0, 0.0))
-    check("socket tail perp blade (snap frame)",
-          abs(_taildir.normalized().dot(_wY.normalized())) < 0.05,
+    check("socket tail toward tip (Y=blade)",
+          _taildir.normalized().dot(_wY.normalized()) > 0.99,
           "dot=%.4f" % _taildir.normalized().dot(_wY.normalized()))
     # Idempotent re-seat + validation blind to extras.
     lines2, name2 = rig_socket.create_hand_socket(arm, "R")

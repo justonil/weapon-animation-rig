@@ -47,7 +47,9 @@ def _socket_frame(armature, weapon, name):
     """Weapon-local socket rotation (columns X/Y/Z), orthonormal.
 
     Pure mesh mapping, no negations: X along the tuned guard direction
-    (Gram-Schmidt orthogonalized vs the blade), Z along the blade
+    (Gram-Schmidt orthogonalized vs the blade), Y along the blade
+    (Tip direction, after the 90 deg X rotation), Z = Y x X completing
+    right-handed. Determinant
     (blade_axis prop), Y = Z x X completing right-handed. Determinant
     +1 by construction; mesh +X/+Y/+Z land on socket X/Y/Z exactly.
     """
@@ -86,7 +88,12 @@ def _socket_frame(armature, weapon, name):
             "Socket '%s': guard direction parallel to blade." % name)
     x_s = x_s.normalized()
     y_s = z_s.cross(x_s).normalized()
-    cols = [tuple(x_s), tuple(y_s), tuple(z_s)]
+    # Rotate the mapping 90 deg about X so the socket's +Y points to the
+    # Tip (along the blade): Unreal's socket attach and the user's
+    # pipeline expect the bone to LOOK along the blade (verified in
+    # engine). Guard (+X) is preserved; blade moves Z->Y. Right-handed
+    # by construction: new cols = [x_s, z_s, -y_s], det +1.
+    cols = [tuple(x_s), tuple(z_s), tuple(-y_s)]
     return Matrix(cols).transposed()
 
 
@@ -142,10 +149,10 @@ def create_hand_socket(armature, side, hand_bone=None):
         # default, so the bone orientation never equals the mesh frame
         # (bisected 3.35 m tip miss on an exact head seat). The rest
         # matrix carries position AND the mesh-mapped orientation:
-        # mesh +Z (blade) lands on blade_axis, mesh +X (guard bar) on
-        # the tuned guard direction, Y completes right-handed (verified
-        # on the reference origin-to-origin bind and matching
-        # prop/geometry extents). EditBone.matrix assignment decomposes
+        # socket +Y along blade_axis (Tip), socket +X on the tuned guard
+        # direction, Z completing right-handed (verified on the
+        # reference origin-to-origin bind and matching prop/geometry
+        # extents). EditBone.matrix assignment decomposes
         # it into head/tail/roll automatically.
         from mathutils import Matrix
         wrot = (mw_inv @ weapon_world).to_3x3()
@@ -466,7 +473,7 @@ def bake_socket_follow(armature, side, hand_bone=None):
                     % (f, trans, rot))
             tip_want = transforms.get_pose_bone_world_matrix(
                 armature, weapon) @ tip_local
-            tip_got = got @ Vector((0.0, 0.0, tip_dist))
+            tip_got = got @ Vector((0.0, tip_dist, 0.0))
             gap = (tip_want - tip_got).length
             max_gap = max(max_gap, gap)
             if gap > TOL_TRANSLATION:
