@@ -90,6 +90,57 @@ def _check_cycle(armature, bone_name, new_parent):
             and parent.parent is not None else None
 
 
+def _targets_bone(con, armature, bone_name):
+    """True if the constraint reads the bone's transform."""
+    try:
+        target = con.target
+    except Exception:
+        return False
+    if target is None or target.name != armature.name:
+        return False
+    return getattr(con, "subtarget", "") == bone_name
+
+
+def _check_follow_cycle(armature, bone_name, new_parent):
+    """Refuse weapon-under-follower: hand follows weapon via Child Of,
+    so making the weapon a child of the hand closes a feedback loop
+    (hand->weapon->hand). Blender then silently drops one side and all
+    poses go wrong -- detached it holds only until the first Attach
+    creates the constraint, so even a currently-clean hand is refused.
+    (A dedicated socket bone parented to the hand is the cycle-free
+    way to glue the sword to the hand in-engine.)
+    """
+    if new_parent is None:
+        return
+    from ..constants import HAND_BONES
+    if new_parent in tuple(HAND_BONES.values()):
+        raise WeaponRigError(
+            "Cannot parent '%s' under hand '%s': hands follow the "
+            "weapon via attach constraints, that feedback loop breaks "
+            "evaluation (holds only until the first Attach). Glue the "
+            "sword to the hand in-engine with a dedicated socket bone "
+            "instead -- the weapon bone keeps its job."
+            % (bone_name, new_parent))
+    pbones = armature.pose.bones
+    parent_bone = pbones.get(new_parent)
+    if parent_bone is not None:
+        for con in parent_bone.constraints:
+            if _targets_bone(con, armature, BONE_WEAPON) or \
+                    _targets_bone(con, armature, BONE_AIM):
+                raise WeaponRigError(
+                    "Cannot parent '%s' under '%s': '%s' follows the "
+                    "weapon via '%s' -- feedback loop."
+                    % (bone_name, new_parent, new_parent, con.name))
+    me = pbones.get(bone_name)
+    if me is not None:
+        for con in me.constraints:
+            if _targets_bone(con, armature, new_parent):
+                raise WeaponRigError(
+                    "Cannot parent '%s' under '%s': '%s' already "
+                    "follows it via '%s' -- feedback loop."
+                    % (bone_name, new_parent, bone_name, con.name))
+
+
 def _goto_frame(scene, f):
     """frame_set accepting float frames (int + subframe)."""
     import math
@@ -149,6 +200,7 @@ def reparent_weapon_bones(armature, new_parent):
             % (new_parent, hint))
     for bone_name in (BONE_WEAPON, BONE_AIM):
         _check_cycle(armature, bone_name, new_parent)
+        _check_follow_cycle(armature, bone_name, new_parent)
     moved = {}
     for bone_name in (BONE_WEAPON, BONE_AIM):
         cur = armature.data.bones[bone_name].parent

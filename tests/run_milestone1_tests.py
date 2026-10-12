@@ -1219,6 +1219,20 @@ def test_reparent_keep_transform():
     check("worlds intact at armature level", ok3, detail3)
     valid3, text3 = rig_validate.validate_weapon_rig(arm)
     check("validation accepts armature level", valid3, text3)
+    # Feedback-loop refusals: weapon under a hand breaks evaluation
+    # (hand follows weapon via attach constraints), even when detached.
+    for hand in ("c_hand_ik.r", "c_hand_ik.l"):
+        try:
+            rig_reparent.reparent_weapon_bones(arm, hand)
+            check("reparent under '%s' refused" % hand, False,
+                  "no exception")
+        except WeaponRigError as exc:
+            check("reparent under '%s' refused" % hand,
+                  "feedback" in str(exc).lower(), str(exc))
+    # ...while a follower-free bone stays allowed (targeted, not blanket).
+    lines4, moved4 = rig_reparent.reparent_weapon_bones(arm, "c_prop.r")
+    check("reparent under plain bone allowed",
+          set(moved4) == {"weapon", "weapon_aim"}, str(moved4))
 
 
 def build_rig():
